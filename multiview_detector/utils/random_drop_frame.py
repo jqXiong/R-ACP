@@ -49,7 +49,7 @@ def random_drop_frame_with_priority(features, num_cam, tau_1, channel, target_dr
     }
 
     # 确保保存路径存在
-    save_dir = "/data1/fangzr/Research/24-JSAC-EC-multiview/RTFS/temp/feature_temp"
+    save_dir = "/home/agou/Desktop/R-ACP/temp/feature_temp"
     os.makedirs(save_dir, exist_ok=True)
 
     # 遍历所有相机帧，并根据特征的低值优先保留

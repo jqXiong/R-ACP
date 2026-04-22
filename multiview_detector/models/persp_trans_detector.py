@@ -291,7 +291,7 @@ class PerspTransDetector(nn.Module):
         feature4prediction = torch.reshape(feature4prediction, (B, N, (self.tau_1 +1) * self.channel, 270, 480)) # (B, N, (self.tau_1 +1) * channel, 270, 480)
 
         # Read the epoch from the log file
-        with open("/data1/fangzr/Research/24-JSAC-EC-multiview/RTFS-2/temp/Calibration/epoch.log", 'r') as f:
+        with open("/home/agou/Desktop/R-ACP/temp/Calibration/epoch.log", 'r') as f:
             epoch = int(f.read().strip())
 
 
@@ -300,7 +300,7 @@ class PerspTransDetector(nn.Module):
             print(f"Epoch: {epoch}, Reading CSV for test parameters...")
 
             # Read the CSV file for error parameters
-            csv_data = pd.read_csv("/data1/fangzr/Research/24-JSAC-EC-multiview/RTFS-2/temp/Calibration/calibration_test_rotation_error.csv")
+            csv_data = pd.read_csv("/home/agou/Desktop/R-ACP/temp/Calibration/calibration_test_rotation_error.csv")
             test_params = csv_data[csv_data["Epoch"] == epoch].iloc[0]
             translation_error = test_params['Translation Error']
             rotation_error = test_params['Rotation Error']
@@ -369,7 +369,7 @@ class PerspTransDetector(nn.Module):
         world_features = torch.cat(world_features, dim=1)  # 拼接后变成张量
 
         # 假设已经在模型中定义了该函数，调用时可以这样做
-        save_dir = '/data1/fangzr/Research/24-JSAC-EC-multiview/RTFS-2/temp/map_res'
+        save_dir = '/home/agou/Desktop/R-ACP/temp/map_res/'
         self.save_map_result_images(world_features, self.coord_map, save_dir)
 
 

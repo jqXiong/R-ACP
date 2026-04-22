@@ -203,7 +203,7 @@ class PerspectiveTrainer(BaseTrainer):
                         
 
                         print(f"bits_loss: {bits_loss.item()}, capacity: {self.capacity}")
-                        print(f"Camera {cam_num} at frame {frame} detected {num_targets} targets, 
+                        print(f"Camera {cam_num} at frame {frame} detected {num_targets} targets,") 
                         
                     else:
                         print(f"No positions detected for camera {cam_num} at frame {current_frame}. Skipping...")

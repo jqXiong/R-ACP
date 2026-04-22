@@ -1,3 +1,6 @@
+
 .codex
 .cursor
 *.zip
+Data/
+logs/

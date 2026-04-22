@@ -16,7 +16,8 @@ from multiview_detector.models.persp_trans_detector import PerspTransDetector
 from multiview_detector.utils.logger import Logger
 from multiview_detector.utils.image_utils import img_color_denormalize
 from multiview_detector.trainer import PerspectiveTrainer
-    
+if not hasattr(torch, '_six'):
+    torch._six = type('six', (), {'string_classes': (str, bytes)})    
 
 def main(args):
     # seed
