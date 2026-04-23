@@ -143,7 +143,7 @@ if __name__ == '__main__':
     parser.add_argument('--seed', type=int, default=1, help='random seed (default: None)')
     parser.add_argument('--tau_1', type=int, default=0) # for fusion model
     parser.add_argument('--tau_2', type=int, default=1) # for temporal entropy module
-    parser.add_argument('--dataset_path', type=str, default='../Wildtrack_dataset')
+    parser.add_argument('--dataset_path', type=str, default='./Data/Wildtrack')
     parser.add_argument('--model_path', type=str, default="")
     parser.add_argument('--drop_prob', type=float, default=1e-1) # for random drop frame
     parser.add_argument('--method', type=str, default='baseline', choices=['baseline', 'proposed_jscc'])

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-DATASET_PATH="${DATASET_PATH:-../Wildtrack_dataset}"
+DATASET_PATH="${DATASET_PATH:-./Data/Wildtrack}"
 MODEL_PATH="${MODEL_PATH:-./models_temp/MultiviewDetector.pth}"
 EPOCHS="${EPOCHS:-30}"
 TAU1="${TAU1:-2}"
