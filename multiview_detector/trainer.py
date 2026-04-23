@@ -159,6 +159,7 @@ class PerspectiveTrainer(BaseTrainer):
 
                 # 遍历每个 batch
                 for b in range(cam_map_res.size(0)):
+                    current_frame = frame[b].item() if isinstance(frame, torch.Tensor) and frame.numel() > 1 else frame.item()
                     map_grid_res = cam_map_res[b].detach().cpu().squeeze()
 
                     # 提取超过阈值的分数
@@ -167,9 +168,12 @@ class PerspectiveTrainer(BaseTrainer):
                     # 获取超过阈值的坐标
                     positions = (map_grid_res > self.cls_thres).nonzero()
 
+                    frame_dir = os.path.join(test_data_dir, f"frame_{current_frame}")
+                    if not os.path.exists(frame_dir):
+                        os.makedirs(frame_dir)
+
                     if positions.nelement() > 0:
                         # print(f"Positions detected for camera {cam_num} at frame {current_frame}. Saving...")
-                        # current_frame = frame[b].item() if isinstance(frame, torch.Tensor) and frame.numel() > 1 else frame.item()
 
                         # 将相机编号、帧 ID、坐标和分数保存到 .txt 文件
                         results = torch.cat([torch.ones_like(scores) * cam_num,
@@ -196,15 +200,15 @@ class PerspectiveTrainer(BaseTrainer):
                         # print(f"Saving NMS coordinates to: {nms_txt_path}")
                         with open(nms_txt_path, 'w') as f:
                             np.savetxt(f, filtered_positions.numpy(), fmt='%.8f')
-                            
+
                         # AoPT计算相关
                         nms_data = np.loadtxt(nms_txt_path)
                         num_targets = len(nms_data) if nms_data.ndim > 1 else 1  # NMS文件的行数即为目标数目
-                        
+
 
                         print(f"bits_loss: {bits_loss.item()}, capacity: {self.capacity}")
-                        print(f"Camera {cam_num} at frame {frame} detected {num_targets} targets,") 
-                        
+                        print(f"Camera {cam_num} at frame {frame} detected {num_targets} targets,")
+
                     else:
                         print(f"No positions detected for camera {cam_num} at frame {current_frame}. Skipping...")
 

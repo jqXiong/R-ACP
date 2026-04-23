@@ -5,6 +5,7 @@ import sys
 import shutil
 from distutils.dir_util import copy_tree
 import datetime
+import csv
 import tqdm
 import numpy as np
 import torch
@@ -18,6 +19,29 @@ from multiview_detector.utils.image_utils import img_color_denormalize
 from multiview_detector.trainer import PerspectiveTrainer
 if not hasattr(torch, '_six'):
     torch._six = type('six', (), {'string_classes': (str, bytes)})    
+
+def _load_existing_snr_rows(csv_path):
+    existing = {}
+    if not os.path.exists(csv_path):
+        return existing
+    with open(csv_path, 'r') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                s = float(row['snr_db'])
+                existing[s] = (float(row['moda']), float(row['comm_kb']))
+            except Exception:
+                continue
+    return existing
+
+
+def _write_snr_rows(csv_path, rows_by_snr):
+    with open(csv_path, 'w') as f:
+        f.write('snr_db,moda,comm_kb\n')
+        for s in sorted(rows_by_snr.keys()):
+            moda_s, bit_s = rows_by_snr[s]
+            f.write(f'{s},{moda_s},{bit_s}\n')
+
 
 def main(args):
     # seed
@@ -94,11 +118,17 @@ def main(args):
         )
 
         if args.snr_sweep:
-            sweep_results = []
             snr_values = [float(x.strip()) for x in args.snr_sweep.split(',') if x.strip()]
+            sweep_csv_path = os.path.join(logdir, f'snr_sweep_epoch_{epoch}.csv')
+            rows_by_snr = _load_existing_snr_rows(sweep_csv_path) if args.snr_sweep_resume else {}
+
             original_test_snr_db = model.test_snr_db
             try:
                 for s in snr_values:
+                    if args.snr_sweep_resume and s in rows_by_snr:
+                        print(f'SNR sweep skip {s:.1f} dB (already exists).')
+                        continue
+
                     model.test_snr_db = s
                     print(f'SNR sweep testing at {s:.1f} dB...')
                     _, _, moda_s, bit_s = trainer.test(
@@ -107,14 +137,10 @@ def main(args):
                         train_set.gt_fpath,
                         False,
                     )
-                    sweep_results.append((s, moda_s, bit_s))
+                    rows_by_snr[s] = (moda_s, bit_s)
+                    _write_snr_rows(sweep_csv_path, rows_by_snr)
             finally:
                 model.test_snr_db = original_test_snr_db
-
-            with open(os.path.join(logdir, f'snr_sweep_epoch_{epoch}.csv'), 'w') as f:
-                f.write('snr_db,moda,comm_kb\n')
-                for s, moda_s, bit_s in sweep_results:
-                    f.write(f'{s},{moda_s},{bit_s}\n')
 
         if minimum_bits_loss > avg_bit_loss:
             minimum_bits_loss = avg_bit_loss
@@ -159,6 +185,7 @@ if __name__ == '__main__':
     parser.add_argument('--ablate_no_analog_channel', action='store_true')
     parser.add_argument('--ablate_no_cross_view', action='store_true')
     parser.add_argument('--snr_sweep', type=str, default='')
+    parser.add_argument('--snr_sweep_resume', action='store_true')
     parser.add_argument('--exp_name', type=str, default='')
 
 
