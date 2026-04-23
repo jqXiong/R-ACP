@@ -88,6 +88,121 @@ class AdaptiveTemporalFusionModule(nn.Module):
         return x
 
 
+class ChannelSemanticAwareJSCC(nn.Module):
+    def __init__(self, in_channels, latent_channels, channel_type='rayleigh', eps=1e-6):
+        super(ChannelSemanticAwareJSCC, self).__init__()
+        self.channel_type = channel_type
+        self.eps = eps
+        mid = max(in_channels // 2, 1)
+
+        self.importance_head = nn.Sequential(
+            nn.Conv2d(in_channels, mid, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid, 1, kernel_size=1),
+            nn.Sigmoid()
+        )
+
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, 2 * latent_channels, kernel_size=1)
+        )
+
+        self.decoder = nn.Sequential(
+            nn.Conv2d(2 * latent_channels, in_channels, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1)
+        )
+
+        self.snr_mlp = nn.Sequential(
+            nn.Linear(1, 16),
+            nn.ReLU(inplace=True),
+            nn.Linear(16, 2 * latent_channels)
+        )
+
+    def apply_channel(self, z, snr_db):
+        B = z.shape[0]
+        snr_linear = torch.pow(10.0, snr_db / 10.0).view(B, 1, 1, 1)
+        noise_std = torch.sqrt(1.0 / (2.0 * snr_linear + self.eps))
+
+        if self.channel_type == 'awgn':
+            return z + torch.randn_like(z) * noise_std
+
+        zr, zi = torch.chunk(z, 2, dim=1)
+        hr = torch.randn_like(zr) / math.sqrt(2.0)
+        hi = torch.randn_like(zi) / math.sqrt(2.0)
+        nr = torch.randn_like(zr) * noise_std
+        ni = torch.randn_like(zi) * noise_std
+
+        yr = hr * zr - hi * zi + nr
+        yi = hr * zi + hi * zr + ni
+        denom = hr.pow(2) + hi.pow(2) + self.eps
+        eqr = (yr * hr + yi * hi) / denom
+        eqi = (yi * hr - yr * hi) / denom
+        return torch.cat([eqr, eqi], dim=1)
+
+    def forward(self, x, snr_db):
+        B = x.shape[0]
+        importance = self.importance_head(x)
+        z = self.encoder(x)
+
+        snr_norm = (snr_db / 20.0).clamp(-1.5, 1.5)
+        snr_gain = torch.sigmoid(self.snr_mlp(snr_norm)).view(B, -1, 1, 1)
+        z = z * (1.0 + 1.2 * snr_gain) * (1.0 + 1.5 * importance)
+
+        power = z.pow(2).mean(dim=(1, 2, 3), keepdim=True)
+        z = z / torch.sqrt(power + self.eps)
+
+        z_noisy = self.apply_channel(z, snr_db)
+        x_hat = x + self.decoder(z_noisy)
+        return x_hat, importance
+
+
+class CrossViewSemanticDenoising(nn.Module):
+    def __init__(self, channels, num_heads=4):
+        super(CrossViewSemanticDenoising, self).__init__()
+        self.num_heads = num_heads
+        self.head_dim = channels // num_heads
+
+        self.q_proj = nn.Conv2d(channels, channels, kernel_size=1)
+        self.k_proj = nn.Conv2d(channels, channels, kernel_size=1)
+        self.v_proj = nn.Conv2d(channels, channels, kernel_size=1)
+        self.out_proj = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1)
+        )
+
+    def forward(self, bev_views):
+        B, N, C, H, W = bev_views.shape
+        global_query = bev_views.mean(dim=1)
+
+        q = self.q_proj(global_query).view(B, 1, self.num_heads, self.head_dim, H, W)
+        k = self.k_proj(bev_views.reshape(B * N, C, H, W)).view(B, N, self.num_heads, self.head_dim, H, W)
+        v = self.v_proj(bev_views.reshape(B * N, C, H, W)).view(B, N, self.num_heads, self.head_dim, H, W)
+
+        score = (q * k).sum(dim=3) / math.sqrt(self.head_dim)
+        attn = torch.softmax(score, dim=1)
+
+        fused = (attn.unsqueeze(3) * v).sum(dim=1).reshape(B, C, H, W)
+        fused = self.out_proj(fused) + global_query
+        return fused, attn.mean(dim=2)
+
+
+class ProposedMapHead(nn.Module):
+    def __init__(self, in_channels):
+        super(ProposedMapHead, self).__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, kernel_size=3, padding=2, dilation=2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 1, kernel_size=3, padding=4, dilation=4, bias=False)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
 
 
 
@@ -100,6 +215,18 @@ class PerspTransDetector(nn.Module):
         self.tau_2 = args.tau_2
         self.tau_1 = args.tau_1
         self.drop_prob = args.drop_prob
+        self.method = getattr(args, 'method', 'baseline')
+        self.disable_quantization = getattr(args, 'disable_quantization', False)
+        self.jscc_channel_type = getattr(args, 'jscc_channel_type', 'rayleigh')
+        self.snr_min_db = getattr(args, 'snr_min_db', 0.0)
+        self.snr_max_db = getattr(args, 'snr_max_db', 20.0)
+        self.test_snr_db = getattr(args, 'test_snr_db', 5.0)
+        self.cross_view_heads = getattr(args, 'cross_view_heads', 4)
+        self.ablate_no_jscc = getattr(args, 'ablate_no_jscc', False)
+        self.ablate_no_csi = getattr(args, 'ablate_no_csi', False)
+        self.ablate_no_analog_channel = getattr(args, 'ablate_no_analog_channel', False)
+        self.ablate_no_cross_view = getattr(args, 'ablate_no_cross_view', False)
+
         # Store intrinsic and extrinsic matrices without adding errors
         self.intrinsic_matrices = dataset.base.intrinsic_matrices
         self.extrinsic_matrices = dataset.base.extrinsic_matrices
@@ -163,6 +290,24 @@ class PerspTransDetector(nn.Module):
 
 
        
+        self.proposed_tx_channels = (self.tau_1 + 1) * self.channel
+        proposed_latent_channels = getattr(args, 'jscc_latent_channels', -1)
+        if proposed_latent_channels <= 0:
+            proposed_latent_channels = self.proposed_tx_channels
+
+        self.proposed_jscc = ChannelSemanticAwareJSCC(
+            in_channels=self.proposed_tx_channels,
+            latent_channels=proposed_latent_channels,
+            channel_type=self.jscc_channel_type
+        ).to('cuda:0')
+
+        self.proposed_cross_view = CrossViewSemanticDenoising(
+            channels=self.proposed_tx_channels,
+            num_heads=self.cross_view_heads
+        ).to('cuda:0')
+
+        self.proposed_map_head = ProposedMapHead(self.proposed_tx_channels + 2).to('cuda:0')
+
         pretrained_model_path = self.args.model_path
 
         model_dict = torch.load(pretrained_model_path)
@@ -238,7 +383,8 @@ class PerspTransDetector(nn.Module):
         img_feature = self.base_pt1(imgs.to('cuda:1'))
         img_feature = self.base_pt2(img_feature.to('cuda:0'))
         img_feature = self.feature_extraction(img_feature)
-        img_feature = torch.round(img_feature)
+        if not self.disable_quantization:
+            img_feature = torch.round(img_feature)
 
 
         _, C, H, W = img_feature.shape
@@ -248,7 +394,82 @@ class PerspTransDetector(nn.Module):
         return img_feature # (B,N,channel,90,160)
 
 
+    def sample_snr_db(self, batch_size, device):
+        if self.training:
+            return torch.empty(batch_size, 1, device=device).uniform_(self.snr_min_db, self.snr_max_db)
+        return torch.full((batch_size, 1), self.test_snr_db, device=device)
+
+    def forward_proposed(self, imgs_list):
+        imgs_list_feature = []
+        B, T, N, C, H, W = imgs_list.shape
+        assert N == self.num_cam
+        tau = max(self.tau_1, self.tau_2)
+        for i in range(tau + 1):
+            imgs = imgs_list[:, i]
+            imgs_feature = self.feature_extraction_step(imgs)
+            imgs_list_feature.append(imgs_feature.unsqueeze(dim=1))
+        imgs_list_feature = torch.cat(imgs_list_feature, dim=1)
+
+        to_be_transmitted_feature = imgs_list_feature[:, self.tau_2]
+        conditional_features = imgs_list_feature[:, :self.tau_2]
+        conditional_features = torch.swapaxes(conditional_features, 1, 2)
+        conditional_features = torch.reshape(conditional_features, (B, N, self.tau_2 * self.channel, 90, 160))
+        conditional_features = torch.reshape(conditional_features, (B * N, self.tau_2 * self.channel, 90, 160))
+
+        gaussian_params = self.temporal_entropy_model(conditional_features)
+        gaussian_params = torch.reshape(gaussian_params, (B, N, 2 * self.channel, 90, 160))
+        scales_hat, means_hat = gaussian_params.chunk(2, dim=2)
+        feature_likelihoods = GaussianLikelihoodEstimation(to_be_transmitted_feature, scales_hat, means=means_hat)
+        bits_loss = (torch.log(feature_likelihoods).sum() / (-math.log(2)))
+
+        feature4prediction = imgs_list_feature[:, -(self.tau_1 + 1):]
+        feature4prediction = torch.swapaxes(feature4prediction, 1, 2)
+        feature4prediction = torch.reshape(feature4prediction, (B, N, self.proposed_tx_channels, 90, 160))
+        feature4prediction = torch.reshape(feature4prediction, (B * N, self.proposed_tx_channels, 90, 160))
+        feature4prediction = F.interpolate(feature4prediction, size=self.upsample_shape, mode='bilinear')
+        feature4prediction = torch.reshape(feature4prediction, (B, N, self.proposed_tx_channels, 270, 480))
+
+        snr_db = self.sample_snr_db(B, feature4prediction.device)
+        if self.ablate_no_csi:
+            snr_db = torch.full_like(snr_db, self.test_snr_db)
+
+        bev_views = []
+        for cam in range(self.num_cam):
+            if self.ablate_no_jscc:
+                tx_feat = feature4prediction[:, cam]
+            else:
+                if self.ablate_no_analog_channel:
+                    tx_feat, _ = self.proposed_jscc(feature4prediction[:, cam], torch.full_like(snr_db, 100.0))
+                else:
+                    tx_feat, _ = self.proposed_jscc(feature4prediction[:, cam], snr_db)
+            proj_mat = self.proj_mats[cam].repeat([B, 1, 1]).float().to('cuda:0')
+            bev_views.append(kornia.geometry.transform.warp_perspective(tx_feat.to('cuda:0'), proj_mat, self.reducedgrid_shape))
+
+        bev_views = torch.stack(bev_views, dim=1)
+        if self.ablate_no_cross_view:
+            fused_bev = bev_views.mean(dim=1)
+        else:
+            fused_bev, _ = self.proposed_cross_view(bev_views)
+
+        coord = self.coord_map.repeat([B, 1, 1, 1]).to('cuda:0')
+        map_result = self.proposed_map_head(torch.cat([fused_bev, coord], dim=1))
+        bits_loss = bits_loss / 8 / 1024
+
+        if not self.training:
+            map_results = []
+            for cam_num in range(self.num_cam):
+                map_result_single = self.proposed_map_head(torch.cat([bev_views[:, cam_num], coord], dim=1))
+                map_results.append(map_result_single)
+            map_results = torch.cat(map_results, dim=1)
+        else:
+            map_results = torch.zeros(B, self.num_cam, map_result.shape[-2], map_result.shape[-1], device=map_result.device)
+
+        return map_result, bits_loss, map_results
+
     def forward(self, imgs_list, visualize=False):
+        if self.method == 'proposed_jscc':
+            return self.forward_proposed(imgs_list)
+
 
         imgs_list_feature = []
         B, T ,N, C, H, W = imgs_list.shape
@@ -290,55 +511,77 @@ class PerspTransDetector(nn.Module):
         feature4prediction = F.interpolate(feature4prediction, size = self.upsample_shape, mode='bilinear') # (B, N, (self.tau_1 +1) * channel, H, W)
         feature4prediction = torch.reshape(feature4prediction, (B, N, (self.tau_1 +1) * self.channel, 270, 480)) # (B, N, (self.tau_1 +1) * channel, 270, 480)
 
-        # Read the epoch from the log file
-        with open("/home/agou/Desktop/R-ACP/temp/Calibration/epoch.log", 'r') as f:
-            epoch = int(f.read().strip())
+        # Read the epoch from the local log file (fallback to 0 if unavailable)
+        epoch = 0
+        if os.path.exists('epoch.log'):
+            try:
+                with open('epoch.log', 'r') as f:
+                    epoch = int(f.read().strip())
+            except Exception:
+                epoch = 0
 
 
         # Only update error parameters for epoch > 10 and during testing phase
         if epoch > self.epoch_thres and not self.training:
             print(f"Epoch: {epoch}, Reading CSV for test parameters...")
 
-            # Read the CSV file for error parameters
-            csv_data = pd.read_csv("/home/agou/Desktop/R-ACP/temp/Calibration/calibration_test_rotation_error.csv")
-            test_params = csv_data[csv_data["Epoch"] == epoch].iloc[0]
-            translation_error = test_params['Translation Error']
-            rotation_error = test_params['Rotation Error']
-            error_camera = test_params['error_camera']
-            print(f"Loaded params - Translation Error: {translation_error}, Rotation Error: {rotation_error}, Error Camera: {error_camera}")
+            csv_path = os.path.join('temp', 'Calibration', 'calibration_test_rotation_error.csv')
+            if not os.path.exists(csv_path):
+                print(f"Calibration CSV not found: {csv_path}, skip error injection.")
+                self.error_camera = []
+                self.translation_error = 0.0
+                self.rotation_error = 0.0
+            else:
+                csv_data = pd.read_csv(csv_path)
+                if "Epoch" not in csv_data.columns or csv_data[csv_data["Epoch"] == epoch].empty:
+                    print(f"No calibration row for epoch {epoch}, skip error injection.")
+                    self.error_camera = []
+                    self.translation_error = 0.0
+                    self.rotation_error = 0.0
+                else:
+                    test_params = csv_data[csv_data["Epoch"] == epoch].iloc[0]
+                    translation_error = test_params['Translation Error']
+                    rotation_error = test_params['Rotation Error']
+                    error_camera = test_params['error_camera']
+                    print(f"Loaded params - Translation Error: {translation_error}, Rotation Error: {rotation_error}, Error Camera: {error_camera}")
 
-            # Store the parameters in the model instance
-            self.translation_error = translation_error
-            self.rotation_error = rotation_error
-            self.error_camera = error_camera
+                    # Store the parameters in the model instance
+                    self.translation_error = translation_error
+                    self.rotation_error = rotation_error
+                    self.error_camera = error_camera
 
-            # Convert error_camera string to list of integers
-            if isinstance(self.error_camera, str):
-                self.error_camera = [int(cam.strip()) for cam in self.error_camera.split(',') if cam.strip().isdigit()]
-            print(f"Error Camera List: {self.error_camera}")
+                    # Convert error_camera string to list of integers
+                    if isinstance(self.error_camera, str):
+                        self.error_camera = [int(cam.strip()) for cam in self.error_camera.split(',') if cam.strip().isdigit()]
+                    elif isinstance(self.error_camera, (int, float)):
+                        self.error_camera = [int(self.error_camera)]
+                    elif not isinstance(self.error_camera, list):
+                        self.error_camera = []
+                    print(f"Error Camera List: {self.error_camera}")
 
-            # Apply errors only during the test phase
-            extrinsic_matrices = np.array(self.extrinsic_matrices, dtype=np.float64)
+                    # Apply errors only during the test phase
+                    extrinsic_matrices = np.array(self.extrinsic_matrices, dtype=np.float64)
 
-            for cam in self.error_camera:
-                cam = int(cam)
-                if cam >= len(extrinsic_matrices):
-                    raise IndexError(f"Camera index {cam} is out of bounds for extrinsic_matrices.")
+                    for cam in self.error_camera:
+                        cam = int(cam)
+                        if cam >= len(extrinsic_matrices):
+                            raise IndexError(f"Camera index {cam} is out of bounds for extrinsic_matrices.")
 
-                R = extrinsic_matrices[cam][:, :3]
-                T = extrinsic_matrices[cam][:, 3]
+                        R = extrinsic_matrices[cam][:, :3]
+                        T = extrinsic_matrices[cam][:, 3]
 
-                # Apply perturbations
-                rotation_perturbation = np.random.randn(3, 3) * self.rotation_error
-                translation_perturbation = np.random.randn(3) * self.translation_error * 100
-                perturbed_R = R * (1 + rotation_perturbation)
-                perturbed_T = T * (1 + translation_perturbation)
+                        # Apply perturbations
+                        rotation_perturbation = np.random.randn(3, 3) * self.rotation_error
+                        translation_perturbation = np.random.randn(3) * self.translation_error * 100
+                        perturbed_R = R * (1 + rotation_perturbation)
+                        perturbed_T = T * (1 + translation_perturbation)
 
-                extrinsic_matrices[cam][:, :3] = perturbed_R
-                extrinsic_matrices[cam][:, 3] = perturbed_T
+                        extrinsic_matrices[cam][:, :3] = perturbed_R
+                        extrinsic_matrices[cam][:, 3] = perturbed_T
 
-            self.extrinsic_matrices = extrinsic_matrices
-            print(f"Applied translation error {self.translation_error} and rotation error {self.rotation_error} to cameras {self.error_camera}")
+                    self.extrinsic_matrices = extrinsic_matrices
+                    print(f"Applied translation error {self.translation_error} and rotation error {self.rotation_error} to cameras {self.error_camera}")
+
 
         # Only update matrices in test phase and after epoch 10
         if not self.training and epoch > self.epoch_thres:
@@ -369,7 +612,7 @@ class PerspTransDetector(nn.Module):
         world_features = torch.cat(world_features, dim=1)  # 拼接后变成张量
 
         # 假设已经在模型中定义了该函数，调用时可以这样做
-        save_dir = '/home/agou/Desktop/R-ACP/temp/map_res/'
+        save_dir = os.path.join('temp', 'map_res')
         self.save_map_result_images(world_features, self.coord_map, save_dir)
 
 

@@ -57,6 +57,8 @@ def main(args):
     criterion = GaussianMSE().cuda()
 
     logdir = f'logs/' + datetime.datetime.today().strftime('%Y-%m-%d_%H-%M-%S')
+    if args.exp_name:
+        logdir = f"{logdir}_{args.exp_name}"
 
     os.makedirs(logdir, exist_ok=True)
     copy_tree('./multiview_detector', logdir + '/scripts/multiview_detector')
@@ -78,15 +80,41 @@ def main(args):
         # Log the current epoch to a file
         with open('epoch.log', 'w') as f:
             f.write(f'{epoch}\n')
-            
+
         if epoch <= 10:
             print('Training...')
             train_loss, train_prec = trainer.train(epoch, train_loader, optimizer, args.log_interval, scheduler)
 
         print('Testing...')
-        test_loss, test_prec, moda, avg_bit_loss = trainer.test(test_loader, os.path.join(logdir, 'test.txt'),
-                                                                train_set.gt_fpath, True)
-        
+        test_loss, test_prec, moda, avg_bit_loss = trainer.test(
+            test_loader,
+            os.path.join(logdir, 'test.txt'),
+            train_set.gt_fpath,
+            True,
+        )
+
+        if args.snr_sweep:
+            sweep_results = []
+            snr_values = [float(x.strip()) for x in args.snr_sweep.split(',') if x.strip()]
+            original_test_snr_db = model.test_snr_db
+            try:
+                for s in snr_values:
+                    model.test_snr_db = s
+                    print(f'SNR sweep testing at {s:.1f} dB...')
+                    _, _, moda_s, bit_s = trainer.test(
+                        test_loader,
+                        os.path.join(logdir, f'test_snr_{str(s).replace(".", "p")}.txt'),
+                        train_set.gt_fpath,
+                        False,
+                    )
+                    sweep_results.append((s, moda_s, bit_s))
+            finally:
+                model.test_snr_db = original_test_snr_db
+
+            with open(os.path.join(logdir, f'snr_sweep_epoch_{epoch}.csv'), 'w') as f:
+                f.write('snr_db,moda,comm_kb\n')
+                for s, moda_s, bit_s in sweep_results:
+                    f.write(f'{s},{moda_s},{bit_s}\n')
 
         if minimum_bits_loss > avg_bit_loss:
             minimum_bits_loss = avg_bit_loss
@@ -118,11 +146,23 @@ if __name__ == '__main__':
     parser.add_argument('--dataset_path', type=str, default='../Wildtrack_dataset')
     parser.add_argument('--model_path', type=str, default="")
     parser.add_argument('--drop_prob', type=float, default=1e-1) # for random drop frame
+    parser.add_argument('--method', type=str, default='baseline', choices=['baseline', 'proposed_jscc'])
+    parser.add_argument('--disable_quantization', action='store_true')
+    parser.add_argument('--jscc_channel_type', type=str, default='rayleigh', choices=['awgn', 'rayleigh'])
+    parser.add_argument('--jscc_latent_channels', type=int, default=-1)
+    parser.add_argument('--snr_min_db', type=float, default=0.0)
+    parser.add_argument('--snr_max_db', type=float, default=20.0)
+    parser.add_argument('--test_snr_db', type=float, default=5.0)
+    parser.add_argument('--cross_view_heads', type=int, default=4)
+    parser.add_argument('--ablate_no_jscc', action='store_true')
+    parser.add_argument('--ablate_no_csi', action='store_true')
+    parser.add_argument('--ablate_no_analog_channel', action='store_true')
+    parser.add_argument('--ablate_no_cross_view', action='store_true')
+    parser.add_argument('--snr_sweep', type=str, default='')
+    parser.add_argument('--exp_name', type=str, default='')
 
 
 
-
-    
     args = parser.parse_args()
     #test_the_code(args)
     main(args)
