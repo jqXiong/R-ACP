@@ -29,18 +29,37 @@ def _load_existing_snr_rows(csv_path):
         for row in reader:
             try:
                 s = float(row['snr_db'])
-                existing[s] = (float(row['moda']), float(row['comm_kb']))
             except Exception:
                 continue
+            existing[s] = {
+                'test_loss': float(row.get('test_loss', 'nan')),
+                'test_prec': float(row.get('test_prec', 'nan')),
+                'moda': float(row.get('moda', 'nan')),
+                'modp': float(row.get('modp', 'nan')),
+                'eval_precision': float(row.get('eval_precision', 'nan')),
+                'eval_recall': float(row.get('eval_recall', 'nan')),
+                'comm_kb': float(row.get('comm_kb', row.get('communication_cost', 'nan'))),
+            }
     return existing
 
 
 def _write_snr_rows(csv_path, rows_by_snr):
-    with open(csv_path, 'w') as f:
-        f.write('snr_db,moda,comm_kb\n')
+    headers = ['snr_db', 'test_loss', 'test_prec', 'moda', 'modp', 'eval_precision', 'eval_recall', 'comm_kb']
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=headers)
+        writer.writeheader()
         for s in sorted(rows_by_snr.keys()):
-            moda_s, bit_s = rows_by_snr[s]
-            f.write(f'{s},{moda_s},{bit_s}\n')
+            row = rows_by_snr[s]
+            writer.writerow({
+                'snr_db': s,
+                'test_loss': row.get('test_loss', float('nan')),
+                'test_prec': row.get('test_prec', float('nan')),
+                'moda': row.get('moda', float('nan')),
+                'modp': row.get('modp', float('nan')),
+                'eval_precision': row.get('eval_precision', float('nan')),
+                'eval_recall': row.get('eval_recall', float('nan')),
+                'comm_kb': row.get('comm_kb', float('nan')),
+            })
 
 
 def main(args):
@@ -100,17 +119,18 @@ def main(args):
     max_MODA = 0
     minimum_bits_loss = 2e6
 
-    for epoch in tqdm.tqdm(range(1, args.epochs + 1)):
+    total_epochs = 1 if args.test_only else args.epochs
+    for epoch in tqdm.tqdm(range(1, total_epochs + 1)):
         # Log the current epoch to a file
         with open('epoch.log', 'w') as f:
             f.write(f'{epoch}\n')
 
-        if epoch <= 10:
+        if (not args.test_only) and epoch <= 10:
             print('Training...')
             train_loss, train_prec = trainer.train(epoch, train_loader, optimizer, args.log_interval, scheduler)
 
         print('Testing...')
-        test_loss, test_prec, moda, avg_bit_loss = trainer.test(
+        test_loss, test_prec, moda, modp, eval_precision, eval_recall, avg_bit_loss = trainer.test(
             test_loader,
             os.path.join(logdir, 'test.txt'),
             train_set.gt_fpath,
@@ -131,13 +151,21 @@ def main(args):
 
                     model.test_snr_db = s
                     print(f'SNR sweep testing at {s:.1f} dB...')
-                    _, _, moda_s, bit_s = trainer.test(
+                    test_loss_s, test_prec_s, moda_s, modp_s, eval_precision_s, eval_recall_s, bit_s = trainer.test(
                         test_loader,
                         os.path.join(logdir, f'test_snr_{str(s).replace(".", "p")}.txt'),
                         train_set.gt_fpath,
                         False,
                     )
-                    rows_by_snr[s] = (moda_s, bit_s)
+                    rows_by_snr[s] = {
+                        'test_loss': test_loss_s,
+                        'test_prec': test_prec_s,
+                        'moda': moda_s,
+                        'modp': modp_s,
+                        'eval_precision': eval_precision_s,
+                        'eval_recall': eval_recall_s,
+                        'comm_kb': bit_s,
+                    }
                     _write_snr_rows(sweep_csv_path, rows_by_snr)
             finally:
                 model.test_snr_db = original_test_snr_db
@@ -186,6 +214,7 @@ if __name__ == '__main__':
     parser.add_argument('--ablate_no_cross_view', action='store_true')
     parser.add_argument('--snr_sweep', type=str, default='')
     parser.add_argument('--snr_sweep_resume', action='store_true')
+    parser.add_argument('--test_only', action='store_true')
     parser.add_argument('--exp_name', type=str, default='')
 
 

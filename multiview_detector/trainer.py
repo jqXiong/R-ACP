@@ -217,7 +217,8 @@ class PerspectiveTrainer(BaseTrainer):
             
 
 
-        moda = 0
+        moda, modp = 0.0, 0.0
+        eval_precision, eval_recall = precision_s.avg * 100, recall_s.avg * 100
 
         print('test gt losses', losses, 'statistic', output_map_res_statistic)
 
@@ -233,15 +234,15 @@ class PerspectiveTrainer(BaseTrainer):
             res_list = torch.cat(res_list, dim=0).numpy() if res_list else np.empty([0, 3])
             np.savetxt(res_fpath, res_list, '%d')
 
-            recall, precision, moda, modp = evaluate(os.path.abspath(res_fpath), os.path.abspath(gt_fpath),
-                                                    data_loader.dataset.base.__name__)
+            eval_recall, eval_precision, moda, modp = evaluate(os.path.abspath(res_fpath), os.path.abspath(gt_fpath),
+                                                               data_loader.dataset.base.__name__)
 
             print('moda: {:.2f}%, modp: {:.2f}%, precision: {:.2f}%, recall: {:.2f}%'.
-                format(moda, modp, precision, recall))
+                format(moda, modp, eval_precision, eval_recall))
 
         print('Communication cost: {:.2f} KB'.format(bits_losses / (len(data_loader))))
 
-        return losses / len(data_loader), precision_s.avg * 100, moda, bits_losses / (len(data_loader))
+        return losses / len(data_loader), precision_s.avg * 100, moda, modp, eval_precision, eval_recall, bits_losses / (len(data_loader))
 
 
 class BBOXTrainer(BaseTrainer):

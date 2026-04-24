@@ -10,8 +10,13 @@ def read_snr_csv(path: Path):
         for r in reader:
             rows.append({
                 'snr_db': float(r['snr_db']),
-                'moda': float(r['moda']),
-                'comm_kb': float(r['comm_kb']),
+                'test_loss': float(r.get('test_loss', 'nan')),
+                'test_prec': float(r.get('test_prec', 'nan')),
+                'moda': float(r.get('moda', 'nan')),
+                'modp': float(r.get('modp', 'nan')),
+                'eval_precision': float(r.get('eval_precision', 'nan')),
+                'eval_recall': float(r.get('eval_recall', 'nan')),
+                'comm_kb': float(r.get('comm_kb', 'nan')),
             })
     return rows
 
@@ -53,12 +58,18 @@ def main():
                 'run_dir': str(run_dir),
                 'epoch': int(epoch_str),
                 'snr_db': row['snr_db'],
+                'test_loss': row['test_loss'],
+                'test_prec': row['test_prec'],
                 'moda': row['moda'],
+                'modp': row['modp'],
+                'eval_precision': row['eval_precision'],
+                'eval_recall': row['eval_recall'],
                 'comm_kb': row['comm_kb'],
             })
 
+    headers = ['variant', 'run_dir', 'epoch', 'snr_db', 'test_loss', 'test_prec', 'moda', 'modp', 'eval_precision', 'eval_recall', 'comm_kb']
     with output_path.open('w', encoding='utf-8', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=['variant', 'run_dir', 'epoch', 'snr_db', 'moda', 'comm_kb'])
+        writer = csv.DictWriter(f, fieldnames=headers)
         writer.writeheader()
         for r in summary_rows:
             writer.writerow(r)
