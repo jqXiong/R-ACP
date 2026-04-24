@@ -89,10 +89,14 @@ class AdaptiveTemporalFusionModule(nn.Module):
 
 
 class ChannelSemanticAwareJSCC(nn.Module):
-    def __init__(self, in_channels, latent_channels, channel_type='rayleigh', eps=1e-6):
+    def __init__(self, in_channels, latent_channels, channel_type='rayleigh', eps=1e-6,
+                 csi_gain_scale=0.6, importance_gain_scale=1.0, low_snr_disable_csi_threshold=0.0):
         super(ChannelSemanticAwareJSCC, self).__init__()
         self.channel_type = channel_type
         self.eps = eps
+        self.csi_gain_scale = csi_gain_scale
+        self.importance_gain_scale = importance_gain_scale
+        self.low_snr_disable_csi_threshold = low_snr_disable_csi_threshold
         mid = max(in_channels // 2, 1)
 
         self.importance_head = nn.Sequential(
@@ -148,7 +152,13 @@ class ChannelSemanticAwareJSCC(nn.Module):
 
         snr_norm = (snr_db / 20.0).clamp(-1.5, 1.5)
         snr_gain = torch.sigmoid(self.snr_mlp(snr_norm)).view(B, -1, 1, 1)
-        z = z * (1.0 + 1.2 * snr_gain) * (1.0 + 1.5 * importance)
+
+        if self.low_snr_disable_csi_threshold is not None and self.low_snr_disable_csi_threshold > -999:
+            csi_mask = (snr_db >= self.low_snr_disable_csi_threshold).float().view(B, 1, 1, 1)
+        else:
+            csi_mask = 1.0
+
+        z = z * (1.0 + self.csi_gain_scale * snr_gain * csi_mask) * (1.0 + self.importance_gain_scale * importance)
 
         power = z.pow(2).mean(dim=(1, 2, 3), keepdim=True)
         z = z / torch.sqrt(power + self.eps)
@@ -222,6 +232,9 @@ class PerspTransDetector(nn.Module):
         self.snr_max_db = getattr(args, 'snr_max_db', 20.0)
         self.test_snr_db = getattr(args, 'test_snr_db', 5.0)
         self.cross_view_heads = getattr(args, 'cross_view_heads', 4)
+        self.jscc_csi_gain_scale = getattr(args, 'jscc_csi_gain_scale', 0.6)
+        self.jscc_importance_gain_scale = getattr(args, 'jscc_importance_gain_scale', 1.0)
+        self.jscc_low_snr_disable_csi_threshold = getattr(args, 'jscc_low_snr_disable_csi_threshold', 0.0)
         self.ablate_no_jscc = getattr(args, 'ablate_no_jscc', False)
         self.ablate_no_csi = getattr(args, 'ablate_no_csi', False)
         self.ablate_no_analog_channel = getattr(args, 'ablate_no_analog_channel', False)
@@ -298,7 +311,10 @@ class PerspTransDetector(nn.Module):
         self.proposed_jscc = ChannelSemanticAwareJSCC(
             in_channels=self.proposed_tx_channels,
             latent_channels=proposed_latent_channels,
-            channel_type=self.jscc_channel_type
+            channel_type=self.jscc_channel_type,
+            csi_gain_scale=self.jscc_csi_gain_scale,
+            importance_gain_scale=self.jscc_importance_gain_scale,
+            low_snr_disable_csi_threshold=self.jscc_low_snr_disable_csi_threshold,
         ).to('cuda:0')
 
         self.proposed_cross_view = CrossViewSemanticDenoising(
