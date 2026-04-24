@@ -62,6 +62,18 @@ def _write_snr_rows(csv_path, rows_by_snr):
             })
 
 
+def _save_checkpoint(path, model, optimizer, epoch, args, metrics=None):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    payload = {
+        'model': model.state_dict(),
+        'optimizer': optimizer.state_dict() if optimizer is not None else None,
+        'epoch': epoch,
+        'args': vars(args),
+        'metrics': metrics or {},
+    }
+    torch.save(payload, path)
+
+
 def main(args):
     # seed
     if args.seed is not None:
@@ -118,6 +130,8 @@ def main(args):
 
     max_MODA = 0
     minimum_bits_loss = 2e6
+    best_moda = -1e9
+    save_prefix = args.save_prefix if args.save_prefix else (args.exp_name if args.exp_name else args.method)
 
     total_epochs = 1 if args.test_only else args.epochs
     for epoch in tqdm.tqdm(range(1, total_epochs + 1)):
@@ -176,6 +190,24 @@ def main(args):
         if moda > max_MODA:
             max_MODA = moda
 
+        if not args.test_only:
+            ckpt_metrics = {
+                'test_loss': test_loss,
+                'test_prec': test_prec,
+                'moda': moda,
+                'modp': modp,
+                'eval_precision': eval_precision,
+                'eval_recall': eval_recall,
+                'comm_kb': avg_bit_loss,
+            }
+            latest_ckpt = os.path.join('models_temp', f'{save_prefix}_latest.pth')
+            best_ckpt = os.path.join('models_temp', f'{save_prefix}.pth')
+            _save_checkpoint(latest_ckpt, model, optimizer, epoch, args, ckpt_metrics)
+            if moda >= best_moda:
+                best_moda = moda
+                _save_checkpoint(best_ckpt, model, optimizer, epoch, args, ckpt_metrics)
+                print(f'Saved best checkpoint: {best_ckpt}')
+
         print(f"maximum_MODA is {max_MODA:.2f}%, minimum_bits_loss {minimum_bits_loss:.2f} KB")
 
 
@@ -215,6 +247,7 @@ if __name__ == '__main__':
     parser.add_argument('--snr_sweep', type=str, default='')
     parser.add_argument('--snr_sweep_resume', action='store_true')
     parser.add_argument('--test_only', action='store_true')
+    parser.add_argument('--save_prefix', type=str, default='')
     parser.add_argument('--exp_name', type=str, default='')
 
 

@@ -309,16 +309,15 @@ class PerspTransDetector(nn.Module):
         self.proposed_map_head = ProposedMapHead(self.proposed_tx_channels + 2).to('cuda:0')
 
         pretrained_model_path = self.args.model_path
+        if not pretrained_model_path or (not os.path.exists(pretrained_model_path)):
+            raise FileNotFoundError(f"model_path not found: {pretrained_model_path}")
 
-        model_dict = torch.load(pretrained_model_path)
+        checkpoint = torch.load(pretrained_model_path, map_location='cpu')
+        model_dict = checkpoint['model'] if isinstance(checkpoint, dict) and 'model' in checkpoint else checkpoint
 
-        base_pt1_dict = {k[9:]:v for k,v in model_dict.items() if k[:8] == "base_pt1" }
-        base_pt2_dict = {k[9:]:v for k,v in model_dict.items() if k[:8] == "base_pt2" }
-        feature_extraction_dict = {k[19:]:v for k,v in model_dict.items() if k[:18] == "feature_extraction" }
-
-        self.base_pt1.load_state_dict(base_pt1_dict)
-        self.base_pt2.load_state_dict(base_pt2_dict)
-        self.feature_extraction.load_state_dict(feature_extraction_dict)
+        missing_keys, unexpected_keys = self.load_state_dict(model_dict, strict=False)
+        print(f"Loaded checkpoint from {pretrained_model_path}")
+        print(f"Checkpoint load summary: missing={len(missing_keys)}, unexpected={len(unexpected_keys)}")
 
         for param in self.base_pt1.parameters():
             param.requires_grad = False

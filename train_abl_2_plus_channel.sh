@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+DATASET_PATH="${DATASET_PATH:-./Data/Wildtrack}"
+INIT_MODEL_PATH="${INIT_MODEL_PATH:-./models_temp/MultiviewDetector.pth}"
+EPOCHS="${EPOCHS:-30}"
+TAU1="${TAU1:-2}"
+TAU2="${TAU2:-2}"
+BATCH="${BATCH:-1}"
+
+"${PYTHON_BIN}" main_coding_and_inference.py --dataset_path "${DATASET_PATH}" --model_path "${INIT_MODEL_PATH}" --epochs "${EPOCHS}" --batch_size "${BATCH}" --tau_1 "${TAU1}" --tau_2 "${TAU2}" --method proposed_jscc --ablate_no_jscc --ablate_no_csi --ablate_no_cross_view --save_prefix abl_2_plus_channel --exp_name train_abl_2_plus_channel
