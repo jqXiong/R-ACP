@@ -104,9 +104,10 @@ def main(args):
     # model
     model = PerspTransDetector(train_set, args)
 
+    effective_train_epochs = args.epochs if args.train_epochs <= 0 else min(args.train_epochs, args.epochs)
     optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=args.lr, steps_per_epoch=len(train_loader),
-                                                    epochs=args.epochs)
+                                                    epochs=effective_train_epochs)
 
 
     criterion = GaussianMSE().cuda()
@@ -131,6 +132,7 @@ def main(args):
     max_MODA = 0
     minimum_bits_loss = 2e6
     best_moda = -1e9
+    no_improve_epochs = 0
     save_prefix = args.save_prefix if args.save_prefix else (args.exp_name if args.exp_name else args.method)
 
     total_epochs = 1 if args.test_only else args.epochs
@@ -139,7 +141,7 @@ def main(args):
         with open('epoch.log', 'w') as f:
             f.write(f'{epoch}\n')
 
-        if (not args.test_only) and epoch <= 10:
+        if (not args.test_only) and epoch <= effective_train_epochs:
             print('Training...')
             train_loss, train_prec = trainer.train(epoch, train_loader, optimizer, args.log_interval, scheduler)
 
@@ -203,10 +205,17 @@ def main(args):
             latest_ckpt = os.path.join('models_temp', f'{save_prefix}_latest.pth')
             best_ckpt = os.path.join('models_temp', f'{save_prefix}.pth')
             _save_checkpoint(latest_ckpt, model, optimizer, epoch, args, ckpt_metrics)
-            if moda >= best_moda:
+            if moda >= best_moda + args.early_stop_min_delta:
                 best_moda = moda
+                no_improve_epochs = 0
                 _save_checkpoint(best_ckpt, model, optimizer, epoch, args, ckpt_metrics)
                 print(f'Saved best checkpoint: {best_ckpt}')
+            else:
+                no_improve_epochs += 1
+
+            if args.early_stop_patience > 0 and epoch >= args.early_stop_min_epochs and no_improve_epochs >= args.early_stop_patience:
+                print(f"Early stopping triggered at epoch {epoch}: no improvement for {no_improve_epochs} epochs.")
+                break
 
         print(f"maximum_MODA is {max_MODA:.2f}%, minimum_bits_loss {minimum_bits_loss:.2f} KB")
 
@@ -221,6 +230,7 @@ if __name__ == '__main__':
     parser.add_argument('-b', '--batch_size', type=int, default=1, metavar='N',
                         help='input batch size for training (default: 1)')
     parser.add_argument('--epochs', type=int, default=10, metavar='N', help='Training epoch (default: 10)')
+    parser.add_argument('--train_epochs', type=int, default=-1, metavar='N', help='actual epochs to run training; -1 means use --epochs')
     parser.add_argument('--lr', type=float, default=0.1, metavar='LR', help='learning rate (default: 0.1)')
     parser.add_argument('--weight_decay', type=float, default=5e-4)
     parser.add_argument('--momentum', type=float, default=0.5, metavar='M', help='SGD momentum (default: 0.5)')
@@ -251,6 +261,9 @@ if __name__ == '__main__':
     parser.add_argument('--snr_sweep_resume', action='store_true')
     parser.add_argument('--test_only', action='store_true')
     parser.add_argument('--save_prefix', type=str, default='')
+    parser.add_argument('--early_stop_patience', type=int, default=6)
+    parser.add_argument('--early_stop_min_delta', type=float, default=0.05)
+    parser.add_argument('--early_stop_min_epochs', type=int, default=12)
     parser.add_argument('--exp_name', type=str, default='')
 
 

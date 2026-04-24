@@ -9,4 +9,4 @@ TAU1="${TAU1:-2}"
 TAU2="${TAU2:-2}"
 BATCH="${BATCH:-1}"
 
-"${PYTHON_BIN}" main_coding_and_inference.py --dataset_path "${DATASET_PATH}" --model_path "${INIT_MODEL_PATH}" --epochs "${EPOCHS}" --batch_size "${BATCH}" --tau_1 "${TAU1}" --tau_2 "${TAU2}" --method proposed_jscc --ablate_no_cross_view --save_prefix abl_4_plus_csi --exp_name train_abl_4_plus_csi
+"${PYTHON_BIN}" main_coding_and_inference.py --dataset_path "${DATASET_PATH}" --model_path "${INIT_MODEL_PATH}" --epochs "${EPOCHS}" --train_epochs "${EPOCHS}" --batch_size "${BATCH}" --tau_1 "${TAU1}" --tau_2 "${TAU2}" --method proposed_jscc --ablate_no_cross_view --early_stop_patience 8 --early_stop_min_delta 0.03 --early_stop_min_epochs 14 --save_prefix abl_4_plus_csi --exp_name train_abl_4_plus_csi

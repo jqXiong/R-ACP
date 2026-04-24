@@ -199,19 +199,76 @@ class CrossViewSemanticDenoising(nn.Module):
         return fused, attn.mean(dim=2)
 
 
-class ProposedMapHead(nn.Module):
+class SNRGuidedCrossViewFusion(nn.Module):
+    def __init__(self, channels, num_heads=4):
+        super(SNRGuidedCrossViewFusion, self).__init__()
+        self.attn_fuser = CrossViewSemanticDenoising(channels, num_heads=num_heads)
+        mid = max(channels // 4, 8)
+        self.view_confidence = nn.Sequential(
+            nn.Conv2d(channels, mid, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid, 1, kernel_size=1)
+        )
+        self.snr_gate = nn.Sequential(
+            nn.Linear(1, channels),
+            nn.Sigmoid()
+        )
+
+    def forward(self, bev_views, snr_db=None):
+        B, N, C, H, W = bev_views.shape
+        fused_attn, attn_map = self.attn_fuser(bev_views)
+
+        conf_logits = self.view_confidence(bev_views.reshape(B * N, C, H, W)).reshape(B, N, 1, H, W)
+        conf_weights = torch.softmax(conf_logits, dim=1)
+        fused_conf = (conf_weights * bev_views).sum(dim=1)
+
+        if snr_db is None:
+            gate = fused_attn.new_full((B, C, 1, 1), 0.5)
+        else:
+            snr_norm = (snr_db / 20.0).clamp(-1.5, 1.5)
+            gate = self.snr_gate(snr_norm).view(B, C, 1, 1)
+
+        fused = gate * fused_attn + (1.0 - gate) * fused_conf
+        return fused, attn_map
+
+
+class EnhancedMapHead(nn.Module):
     def __init__(self, in_channels):
-        super(ProposedMapHead, self).__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_channels, 512, kernel_size=3, padding=1),
+        super(EnhancedMapHead, self).__init__()
+        hidden = 256
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, hidden, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden),
+            nn.ReLU(inplace=True)
+        )
+
+        self.branch_d1 = nn.Sequential(
+            nn.Conv2d(hidden, hidden, kernel_size=3, padding=1, dilation=1),
+            nn.ReLU(inplace=True)
+        )
+        self.branch_d2 = nn.Sequential(
+            nn.Conv2d(hidden, hidden, kernel_size=3, padding=2, dilation=2),
+            nn.ReLU(inplace=True)
+        )
+        self.branch_d4 = nn.Sequential(
+            nn.Conv2d(hidden, hidden, kernel_size=3, padding=4, dilation=4),
+            nn.ReLU(inplace=True)
+        )
+
+        self.merge = nn.Sequential(
+            nn.Conv2d(hidden * 3, hidden, kernel_size=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(512, 512, kernel_size=3, padding=2, dilation=2),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(512, 1, kernel_size=3, padding=4, dilation=4, bias=False)
+            nn.Conv2d(hidden, 1, kernel_size=3, padding=1)
         )
 
     def forward(self, x):
-        return self.net(x)
+        x = self.stem(x)
+        b1 = self.branch_d1(x)
+        b2 = self.branch_d2(x)
+        b4 = self.branch_d4(x)
+        fused = torch.cat([b1, b2, b4], dim=1)
+        return self.merge(fused)
+
 
 
 
@@ -317,12 +374,12 @@ class PerspTransDetector(nn.Module):
             low_snr_disable_csi_threshold=self.jscc_low_snr_disable_csi_threshold,
         ).to('cuda:0')
 
-        self.proposed_cross_view = CrossViewSemanticDenoising(
+        self.proposed_cross_view = SNRGuidedCrossViewFusion(
             channels=self.proposed_tx_channels,
             num_heads=self.cross_view_heads
         ).to('cuda:0')
 
-        self.proposed_map_head = ProposedMapHead(self.proposed_tx_channels + 2).to('cuda:0')
+        self.proposed_map_head = EnhancedMapHead(self.proposed_tx_channels + 2).to('cuda:0')
 
         pretrained_model_path = self.args.model_path
         if not pretrained_model_path or (not os.path.exists(pretrained_model_path)):
@@ -464,7 +521,7 @@ class PerspTransDetector(nn.Module):
         if self.ablate_no_cross_view:
             fused_bev = bev_views.mean(dim=1)
         else:
-            fused_bev, _ = self.proposed_cross_view(bev_views)
+            fused_bev, _ = self.proposed_cross_view(bev_views, snr_db)
 
         coord = self.coord_map.repeat([B, 1, 1, 1]).to('cuda:0')
         map_result = self.proposed_map_head(torch.cat([fused_bev, coord], dim=1))
