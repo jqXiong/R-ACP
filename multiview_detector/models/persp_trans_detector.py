@@ -489,6 +489,10 @@ class PerspTransDetector(nn.Module):
 
         return img_feature # (B,N,channel,90,160)
 
+    def sample_snr_db(self, batch_size, device):
+        if self.training:
+            return torch.empty(batch_size, 1, device=device).uniform_(self.snr_min_db, self.snr_max_db)
+        return torch.full((batch_size, 1), self.test_snr_db, device=device)
 
     def sample_rate_scale(self, snr_db):
         snr_norm = (snr_db / 20.0).clamp(-1.5, 1.5)
