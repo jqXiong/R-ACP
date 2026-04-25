@@ -90,13 +90,15 @@ class AdaptiveTemporalFusionModule(nn.Module):
 
 class ChannelSemanticAwareJSCC(nn.Module):
     def __init__(self, in_channels, latent_channels, channel_type='rayleigh', eps=1e-6,
-                 csi_gain_scale=0.6, importance_gain_scale=1.0, low_snr_disable_csi_threshold=0.0):
+                 csi_gain_scale=0.6, importance_gain_scale=1.0, low_snr_disable_csi_threshold=0.0,
+                 min_rate_scale=0.25):
         super(ChannelSemanticAwareJSCC, self).__init__()
         self.channel_type = channel_type
         self.eps = eps
         self.csi_gain_scale = csi_gain_scale
         self.importance_gain_scale = importance_gain_scale
         self.low_snr_disable_csi_threshold = low_snr_disable_csi_threshold
+        self.min_rate_scale = min_rate_scale
         mid = max(in_channels // 2, 1)
 
         self.importance_head = nn.Sequential(
@@ -145,7 +147,7 @@ class ChannelSemanticAwareJSCC(nn.Module):
         eqi = (yi * hr - yr * hi) / denom
         return torch.cat([eqr, eqi], dim=1)
 
-    def forward(self, x, snr_db):
+    def forward(self, x, snr_db, rate_scale=None):
         B = x.shape[0]
         importance = self.importance_head(x)
         z = self.encoder(x)
@@ -160,12 +162,18 @@ class ChannelSemanticAwareJSCC(nn.Module):
 
         z = z * (1.0 + self.csi_gain_scale * snr_gain * csi_mask) * (1.0 + self.importance_gain_scale * importance)
 
+        if rate_scale is None:
+            rate_gate = torch.ones(B, 1, 1, 1, device=x.device, dtype=x.dtype)
+        else:
+            rate_gate = rate_scale.view(B, 1, 1, 1).clamp(self.min_rate_scale, 1.0)
+        z = z * rate_gate
+
         power = z.pow(2).mean(dim=(1, 2, 3), keepdim=True)
         z = z / torch.sqrt(power + self.eps)
 
         z_noisy = self.apply_channel(z, snr_db)
         x_hat = x + self.decoder(z_noisy)
-        return x_hat, importance
+        return x_hat, importance, rate_gate.view(B)
 
 
 class CrossViewSemanticDenoising(nn.Module):
@@ -213,12 +221,20 @@ class SNRGuidedCrossViewFusion(nn.Module):
             nn.Linear(1, channels),
             nn.Sigmoid()
         )
+        self.reliability_proj = nn.Sequential(
+            nn.Linear(3, mid),
+            nn.ReLU(inplace=True),
+            nn.Linear(mid, 1)
+        )
 
-    def forward(self, bev_views, snr_db=None):
+    def forward(self, bev_views, snr_db=None, view_reliability=None):
         B, N, C, H, W = bev_views.shape
         fused_attn, attn_map = self.attn_fuser(bev_views)
 
         conf_logits = self.view_confidence(bev_views.reshape(B * N, C, H, W)).reshape(B, N, 1, H, W)
+        if view_reliability is not None:
+            rel_bias = self.reliability_proj(view_reliability.reshape(B * N, 3)).reshape(B, N, 1, 1, 1)
+            conf_logits = conf_logits + rel_bias
         conf_weights = torch.softmax(conf_logits, dim=1)
         fused_conf = (conf_weights * bev_views).sum(dim=1)
 
@@ -229,7 +245,7 @@ class SNRGuidedCrossViewFusion(nn.Module):
             gate = self.snr_gate(snr_norm).view(B, C, 1, 1)
 
         fused = gate * fused_attn + (1.0 - gate) * fused_conf
-        return fused, attn_map
+        return fused, attn_map, conf_weights
 
 
 class EnhancedMapHead(nn.Module):
@@ -296,6 +312,13 @@ class PerspTransDetector(nn.Module):
         self.ablate_no_csi = getattr(args, 'ablate_no_csi', False)
         self.ablate_no_analog_channel = getattr(args, 'ablate_no_analog_channel', False)
         self.ablate_no_cross_view = getattr(args, 'ablate_no_cross_view', False)
+        self.rate_aware_training = getattr(args, 'rate_aware_training', False)
+        self.target_comm_kb = getattr(args, 'target_comm_kb', 28.5)
+        self.min_keep_per_camera = getattr(args, 'min_keep_per_camera', 1)
+        self.keep_latest_token = getattr(args, 'keep_latest_token', True)
+        self.frame_dropout_noise_std = getattr(args, 'frame_dropout_noise_std', 0.05)
+        self.lambda_consistency = getattr(args, 'lambda_consistency', 0.03)
+        self.rate_view_dropout_prob = getattr(args, 'rate_view_dropout_prob', 0.2)
 
         # Store intrinsic and extrinsic matrices without adding errors
         self.intrinsic_matrices = dataset.base.intrinsic_matrices
@@ -372,6 +395,7 @@ class PerspTransDetector(nn.Module):
             csi_gain_scale=self.jscc_csi_gain_scale,
             importance_gain_scale=self.jscc_importance_gain_scale,
             low_snr_disable_csi_threshold=self.jscc_low_snr_disable_csi_threshold,
+            min_rate_scale=0.25,
         ).to('cuda:0')
 
         self.proposed_cross_view = SNRGuidedCrossViewFusion(
@@ -466,19 +490,19 @@ class PerspTransDetector(nn.Module):
         return img_feature # (B,N,channel,90,160)
 
 
-    def sample_snr_db(self, batch_size, device):
-        if self.training:
-            return torch.empty(batch_size, 1, device=device).uniform_(self.snr_min_db, self.snr_max_db)
-        return torch.full((batch_size, 1), self.test_snr_db, device=device)
+    def sample_rate_scale(self, snr_db):
+        snr_norm = (snr_db / 20.0).clamp(-1.5, 1.5)
+        rate = 0.55 + 0.45 * torch.sigmoid(2.0 * snr_norm)
+        return rate.clamp(0.25, 1.0)
 
     def forward_proposed(self, imgs_list):
-        imgs_list_feature = []
         B, T, N, C, H, W = imgs_list.shape
         assert N == self.num_cam
         tau = max(self.tau_1, self.tau_2)
+
+        imgs_list_feature = []
         for i in range(tau + 1):
-            imgs = imgs_list[:, i]
-            imgs_feature = self.feature_extraction_step(imgs)
+            imgs_feature = self.feature_extraction_step(imgs_list[:, i])
             imgs_list_feature.append(imgs_feature.unsqueeze(dim=1))
         imgs_list_feature = torch.cat(imgs_list_feature, dim=1)
 
@@ -492,7 +516,7 @@ class PerspTransDetector(nn.Module):
         gaussian_params = torch.reshape(gaussian_params, (B, N, 2 * self.channel, 90, 160))
         scales_hat, means_hat = gaussian_params.chunk(2, dim=2)
         feature_likelihoods = GaussianLikelihoodEstimation(to_be_transmitted_feature, scales_hat, means=means_hat)
-        bits_loss = (torch.log(feature_likelihoods).sum() / (-math.log(2)))
+        entropy_bits_loss = (torch.log(feature_likelihoods).sum() / (-math.log(2)))
 
         feature4prediction = imgs_list_feature[:, -(self.tau_1 + 1):]
         feature4prediction = torch.swapaxes(feature4prediction, 1, 2)
@@ -501,31 +525,82 @@ class PerspTransDetector(nn.Module):
         feature4prediction = F.interpolate(feature4prediction, size=self.upsample_shape, mode='bilinear')
         feature4prediction = torch.reshape(feature4prediction, (B, N, self.proposed_tx_channels, 270, 480))
 
+        flat_features = feature4prediction.reshape(B, N * self.proposed_tx_channels, 270, 480)
+        if self.rate_aware_training:
+            flat_features, tx_mask = random_drop_frame_with_priority(
+                flat_features,
+                num_cam=self.num_cam,
+                tau_1=0,
+                channel=self.proposed_tx_channels,
+                target_dropout_rate=self.drop_prob,
+                is_training=self.training,
+                min_keep_per_camera=self.min_keep_per_camera,
+                keep_latest_token=self.keep_latest_token,
+                score_noise_std=self.frame_dropout_noise_std,
+            )
+        else:
+            tx_mask = torch.ones(B, self.num_cam, dtype=flat_features.dtype, device=flat_features.device)
+        feature4prediction = flat_features.view(B, N, self.proposed_tx_channels, 270, 480)
+
         snr_db = self.sample_snr_db(B, feature4prediction.device)
         if self.ablate_no_csi:
             snr_db = torch.full_like(snr_db, self.test_snr_db)
 
+        global_rate_scale = self.sample_rate_scale(snr_db) if self.rate_aware_training else torch.ones(B, 1, device=snr_db.device)
+
         bev_views = []
+        view_rate_scales = []
+        view_snr_norm = (snr_db / 20.0).clamp(-1.5, 1.5)
         for cam in range(self.num_cam):
+            cam_keep = tx_mask[:, cam:cam + 1]
+            cam_feature = feature4prediction[:, cam] * cam_keep.view(B, 1, 1, 1)
+
             if self.ablate_no_jscc:
-                tx_feat = feature4prediction[:, cam]
+                tx_feat = cam_feature
+                rate_used = cam_keep.view(B)
             else:
                 if self.ablate_no_analog_channel:
-                    tx_feat, _ = self.proposed_jscc(feature4prediction[:, cam], torch.full_like(snr_db, 100.0))
+                    tx_feat, _, rate_used = self.proposed_jscc(cam_feature, torch.full_like(snr_db, 100.0), rate_scale=global_rate_scale)
                 else:
-                    tx_feat, _ = self.proposed_jscc(feature4prediction[:, cam], snr_db)
+                    tx_feat, _, rate_used = self.proposed_jscc(cam_feature, snr_db, rate_scale=global_rate_scale)
+                rate_used = rate_used * cam_keep.view(B)
+
             proj_mat = self.proj_mats[cam].repeat([B, 1, 1]).float().to('cuda:0')
             bev_views.append(kornia.geometry.transform.warp_perspective(tx_feat.to('cuda:0'), proj_mat, self.reducedgrid_shape))
+            view_rate_scales.append(rate_used)
 
         bev_views = torch.stack(bev_views, dim=1)
+        view_rate_tensor = torch.stack(view_rate_scales, dim=1)
+        view_reliability = torch.stack([
+            view_snr_norm.repeat(1, self.num_cam),
+            tx_mask,
+            view_rate_tensor,
+        ], dim=-1)
+
         if self.ablate_no_cross_view:
             fused_bev = bev_views.mean(dim=1)
+            conf_weights = torch.full((B, self.num_cam, 1, 1, 1), 1.0 / self.num_cam, device=bev_views.device, dtype=bev_views.dtype)
         else:
-            fused_bev, _ = self.proposed_cross_view(bev_views, snr_db)
+            fused_bev, _, conf_weights = self.proposed_cross_view(bev_views, snr_db, view_reliability=view_reliability)
 
         coord = self.coord_map.repeat([B, 1, 1, 1]).to('cuda:0')
         map_result = self.proposed_map_head(torch.cat([fused_bev, coord], dim=1))
-        bits_loss = bits_loss / 8 / 1024
+
+        entropy_kb = entropy_bits_loss / 8 / 1024
+        keep_ratio = tx_mask.mean()
+        rate_ratio = view_rate_tensor.mean()
+        tx_kb_proxy = self.target_comm_kb * keep_ratio * rate_ratio
+
+        if self.training and self.rate_aware_training and self.rate_view_dropout_prob > 0:
+            random_drop = (torch.rand(B, self.num_cam, device=bev_views.device) > self.rate_view_dropout_prob).float()
+            random_drop = torch.maximum(random_drop, tx_mask)
+            random_drop = random_drop / (random_drop.sum(dim=1, keepdim=True) + 1e-6)
+            weak_fused = (bev_views * random_drop.view(B, self.num_cam, 1, 1, 1)).sum(dim=1)
+            consistency_loss = F.mse_loss(weak_fused, fused_bev.detach())
+        else:
+            consistency_loss = map_result.new_tensor(0.0)
+
+        bits_loss = entropy_kb + tx_kb_proxy + self.lambda_consistency * consistency_loss
 
         if not self.training:
             map_results = []
