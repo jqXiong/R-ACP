@@ -258,6 +258,7 @@ if __name__ == '__main__':
     parser.add_argument('--refine_score_noise_std', type=float, default=0.0)
     parser.add_argument('--refine_weighted_entropy', action='store_true')
     parser.add_argument('--refine_enable_token_drop', action='store_true')
+    parser.add_argument('--refine_soft_weighting', action='store_true')
     parser.add_argument('--disable_quantization', action='store_true')
     parser.add_argument('--jscc_channel_type', type=str, default='rayleigh', choices=['awgn', 'rayleigh'])
     parser.add_argument('--jscc_latent_channels', type=int, default=-1)

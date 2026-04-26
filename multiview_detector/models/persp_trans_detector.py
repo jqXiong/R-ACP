@@ -13,6 +13,7 @@ from multiview_detector.models.GaussianProbModel import GaussianLikelihoodEstima
 from multiview_detector.models.resnet import resnet18
 from multiview_detector.utils.random_drop_frame import random_drop_frame
 from multiview_detector.utils.random_drop_frame import random_drop_frame_with_priority
+from multiview_detector.utils.random_drop_frame import random_drop_frame_with_priority_legacy
 
 
 class TemporalEntropyModel(nn.Module):
@@ -281,6 +282,7 @@ class PerspTransDetector(nn.Module):
         self.refine_score_noise_std = getattr(args, 'refine_score_noise_std', 0.0)
         self.refine_weighted_entropy = getattr(args, 'refine_weighted_entropy', False)
         self.refine_enable_token_drop = getattr(args, 'refine_enable_token_drop', False)
+        self.refine_soft_weighting = getattr(args, 'refine_soft_weighting', False)
 
         self.jscc_channel_type = getattr(args, 'jscc_channel_type', 'rayleigh')
         self.snr_min_db = getattr(args, 'snr_min_db', 0.0)
@@ -514,7 +516,9 @@ class PerspTransDetector(nn.Module):
         b, n = current_features.shape[:2]
         keep_count = self._resolve_refine_keep_count()
         if keep_count >= n:
-            return torch.ones(b, n, device=current_features.device, dtype=current_features.dtype)
+            mask = torch.ones(b, n, device=current_features.device, dtype=current_features.dtype)
+            score = current_features.abs().mean(dim=(2, 3, 4))
+            return mask, score
 
         current_score = current_features.abs().mean(dim=(2, 3, 4))
         score = current_score
@@ -533,7 +537,7 @@ class PerspTransDetector(nn.Module):
         top_idx = torch.topk(score, k=keep_count, dim=1, largest=True).indices
         mask = torch.zeros(b, n, device=current_features.device, dtype=current_features.dtype)
         mask.scatter_(1, top_idx, 1.0)
-        return mask
+        return mask, score
 
     def forward_proposed(self, imgs_list):
         b, t, n, c, h, w = imgs_list.shape
@@ -672,13 +676,14 @@ class PerspTransDetector(nn.Module):
         gaussian_params = torch.reshape(gaussian_params, (b, n, 2 * self.channel, 90, 160))
         scales_hat, means_hat = gaussian_params.chunk(2, dim=2)
         if self.method == 'baseline_refined':
-            camera_keep_mask = self._build_refined_camera_mask(
+            camera_keep_mask, camera_score = self._build_refined_camera_mask(
                 to_be_transmitted_feature,
                 conditional_features,
                 scales_hat,
             )
         else:
             camera_keep_mask = torch.ones(b, n, device=to_be_transmitted_feature.device, dtype=to_be_transmitted_feature.dtype)
+            camera_score = camera_keep_mask
 
         likelihood_input = to_be_transmitted_feature
         if self.method == 'baseline_refined':
@@ -719,10 +724,20 @@ class PerspTransDetector(nn.Module):
         world_features = torch.cat(world_features, dim=1)
         camera_token_mask = camera_keep_mask.unsqueeze(-1).repeat(1, 1, self.tau_1 + 1).reshape(b, -1)
 
+        if self.method == 'baseline_refined' and self.refine_soft_weighting:
+            masked_score = camera_score.masked_fill(camera_keep_mask < 0.5, float('-inf'))
+            camera_weights = torch.softmax(masked_score, dim=1) * camera_keep_mask
+            camera_weights = camera_weights / (camera_weights.sum(dim=1, keepdim=True) + 1e-6)
+            feature4prediction = feature4prediction * camera_weights.view(b, n, 1, 1, 1)
+
         if self.enable_map_visual_dump:
             self.save_map_result_images(world_features, self.coord_map, os.path.join('temp', 'map_res'))
 
-        if self.method == 'baseline_refined' and not self.refine_enable_token_drop:
+        if self.method == 'baseline':
+            world_features, mask = random_drop_frame_with_priority_legacy(
+                world_features, self.num_cam, self.tau_1, self.channel, self.drop_prob, is_training=self.training
+            )
+        elif self.method == 'baseline_refined' and not self.refine_enable_token_drop:
             mask = camera_token_mask
             expanded_mask = mask.unsqueeze(2).repeat(1, 1, self.channel).view(b, world_features.shape[1], 1, 1)
             world_features = world_features * expanded_mask
