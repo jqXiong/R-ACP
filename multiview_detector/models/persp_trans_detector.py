@@ -431,9 +431,18 @@ class PerspTransDetector(nn.Module):
         self.feature_extraction.load_state_dict(feature_extraction_dict)
         print(f"Loaded baseline backbone weights from {pretrained_model_path}")
 
-    def process_features_with_temporal_fusion(self, cam_feature, coord_map, is_training=True):
-        b, _, h, w = cam_feature.shape
-        expanded_cam_feature = cam_feature.repeat(1, self.channel * self.num_cam * (self.tau_1 + 1), 1, 1)
+    def process_features_with_temporal_fusion(self, cam_feature, coord_map, cam_idx=0, is_training=True):
+        b, c, h, w = cam_feature.shape
+        expected_channels = self.channel * (self.tau_1 + 1)
+        if c != expected_channels:
+            raise ValueError(f"cam_feature channel mismatch: expected {expected_channels}, got {c}")
+        total_channels = self.channel * self.num_cam * (self.tau_1 + 1)
+        expanded_cam_feature = torch.zeros(
+            b, total_channels, h, w, dtype=cam_feature.dtype, device=cam_feature.device
+        )
+        start = cam_idx * expected_channels
+        end = start + expected_channels
+        expanded_cam_feature[:, start:end, :, :] = cam_feature
         world_features_with_coord = torch.cat(
             [expanded_cam_feature, coord_map.repeat([b, 1, 1, 1]).to(cam_feature.device)],
             dim=1,
@@ -448,7 +457,9 @@ class PerspTransDetector(nn.Module):
             start = cam_num * self.channel * (self.tau_1 + 1)
             end = start + self.channel * (self.tau_1 + 1)
             cam_feature = world_features[:, start:end, :, :]
-            map_result = self.process_features_with_temporal_fusion(cam_feature, coord_map, is_training=self.training)
+            map_result = self.process_features_with_temporal_fusion(
+                cam_feature, coord_map, cam_idx=cam_num, is_training=self.training
+            )
             for bi in range(b):
                 result_image = map_result[bi, 0, :, :].detach().cpu().numpy()
                 image_path = os.path.join(save_dir, f"batch_{bi}_camera_{cam_num}_map_result.png")
@@ -843,6 +854,7 @@ class PerspTransDetector(nn.Module):
                 map_result_single = self.process_features_with_temporal_fusion(
                     cam_feature,
                     self.coord_map,
+                    cam_idx=cam_num,
                     is_training=self.training,
                 )
                 map_results.append(map_result_single)
