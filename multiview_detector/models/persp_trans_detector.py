@@ -553,8 +553,9 @@ class PerspTransDetector(nn.Module):
 
     def _pool_refined_stats(self, current_features, history_features, scales_hat):
         current_stats = current_features.abs().mean(dim=(3, 4))
-        history_stats = history_features.abs().mean(dim=(3, 4)).mean(dim=2)
+        history_stats = history_features.abs().mean(dim=(3, 4))
         uncertainty_stats = scales_hat.abs().mean(dim=(3, 4))
+
         current_scalar = current_stats.mean(dim=2, keepdim=True)
         history_scalar = history_stats.mean(dim=2, keepdim=True)
         uncertainty_scalar = uncertainty_stats.mean(dim=2, keepdim=True)
