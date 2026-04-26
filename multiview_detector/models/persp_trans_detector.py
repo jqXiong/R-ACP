@@ -264,8 +264,9 @@ class EnhancedMapHead(nn.Module):
 class RefinedCameraSelector(nn.Module):
     def __init__(self, feature_channels, hidden_dim=64):
         super().__init__()
+        input_dim = feature_channels * 3 + 2
         self.mlp = nn.Sequential(
-            nn.Linear(feature_channels * 2 + 2, hidden_dim),
+            nn.Linear(input_dim, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(inplace=True),
@@ -276,8 +277,8 @@ class RefinedCameraSelector(nn.Module):
             nn.Sigmoid(),
         )
 
-    def forward(self, current_stats, history_stats, uncertainty_stats, keep_ratio_stats):
-        x = torch.cat([current_stats, history_stats, uncertainty_stats, keep_ratio_stats], dim=-1)
+    def forward(self, current_stats, history_stats, uncertainty_stats, aux_stats):
+        x = torch.cat([current_stats, history_stats, uncertainty_stats, aux_stats], dim=-1)
         hidden = self.mlp(x)
         score = self.score_head(hidden).squeeze(-1)
         scale = 0.75 + 0.5 * self.scale_head(hidden)
@@ -444,7 +445,9 @@ class PerspTransDetector(nn.Module):
         b, _, _, _ = world_features.shape
         os.makedirs(save_dir, exist_ok=True)
         for cam_num in range(self.num_cam):
-            cam_feature = world_features[:, cam_num, :, :].unsqueeze(1)
+            start = cam_num * self.channel * (self.tau_1 + 1)
+            end = start + self.channel * (self.tau_1 + 1)
+            cam_feature = world_features[:, start:end, :, :]
             map_result = self.process_features_with_temporal_fusion(cam_feature, coord_map, is_training=self.training)
             for bi in range(b):
                 result_image = map_result[bi, 0, :, :].detach().cpu().numpy()
@@ -553,36 +556,48 @@ class PerspTransDetector(nn.Module):
 
     def _pool_refined_stats(self, current_features, history_features, scales_hat):
         current_stats = current_features.abs().mean(dim=(3, 4))
-        history_stats = history_features.abs().mean(dim=(3, 4))
         uncertainty_stats = scales_hat.abs().mean(dim=(3, 4))
+
+        if self.tau_2 > 0:
+            b, n, tc, h, w = history_features.shape
+            expected_tc = self.tau_2 * self.channel
+            if tc != expected_tc:
+                raise ValueError(f"history_features channel mismatch: expected {expected_tc}, got {tc}")
+            history_reshaped = history_features.view(b, n, self.tau_2, self.channel, h, w)
+            history_stats = history_reshaped.abs().mean(dim=(2, 4, 5))
+        else:
+            history_stats = torch.zeros_like(current_stats)
 
         current_scalar = current_stats.mean(dim=2, keepdim=True)
         history_scalar = history_stats.mean(dim=2, keepdim=True)
         uncertainty_scalar = uncertainty_stats.mean(dim=2, keepdim=True)
-        keep_ratio_stats = torch.cat([current_scalar - history_scalar, uncertainty_scalar], dim=2)
-        return current_scalar, history_scalar, uncertainty_scalar, keep_ratio_stats
+        aux_stats = torch.cat([current_scalar - history_scalar, uncertainty_scalar], dim=2)
+        return current_stats, history_stats, uncertainty_stats, aux_stats
 
     def _build_refined_camera_mask(self, current_features, history_features, scales_hat):
         b, n = current_features.shape[:2]
         keep_count = self._resolve_refine_keep_count()
-        current_scalar, history_scalar, uncertainty_scalar, keep_ratio_stats = self._pool_refined_stats(
+        current_stats, history_stats, uncertainty_stats, aux_stats = self._pool_refined_stats(
             current_features,
             history_features,
             scales_hat,
         )
         score, scale = self.refined_selector(
-            current_scalar,
-            history_scalar,
-            uncertainty_scalar,
-            keep_ratio_stats,
+            current_stats,
+            history_stats,
+            uncertainty_stats,
+            aux_stats,
         )
+        current_scalar = current_stats.mean(dim=2)
+        history_scalar = history_stats.mean(dim=2)
+        uncertainty_scalar = uncertainty_stats.mean(dim=2)
 
         if self.refine_score_mode == 'current':
-            score = score + current_scalar.squeeze(-1)
+            score = score + current_scalar
         elif self.refine_score_mode == 'current_temporal':
-            score = score + current_scalar.squeeze(-1) + 0.35 * history_scalar.squeeze(-1)
+            score = score + current_scalar + 0.35 * history_scalar
         else:
-            score = score + current_scalar.squeeze(-1) + 0.35 * history_scalar.squeeze(-1) - 0.15 * uncertainty_scalar.squeeze(-1)
+            score = score + current_scalar + 0.35 * history_scalar - 0.15 * uncertainty_scalar
 
         if self.training and self.refine_score_noise_std > 0:
             score = score + torch.randn_like(score) * self.refine_score_noise_std
@@ -764,6 +779,11 @@ class PerspTransDetector(nn.Module):
         feature4prediction = torch.reshape(feature4prediction, (b * n, (self.tau_1 + 1) * self.channel, 90, 160))
         feature4prediction = F.interpolate(feature4prediction, size=self.upsample_shape, mode='bilinear')
         feature4prediction = torch.reshape(feature4prediction, (b, n, (self.tau_1 + 1) * self.channel, 270, 480))
+        if self.method == 'baseline_refined' and self.refine_soft_weighting:
+            masked_score = camera_score.masked_fill(camera_keep_mask < 0.5, float('-inf'))
+            camera_weights = torch.softmax(masked_score, dim=1) * camera_keep_mask
+            camera_weights = camera_weights / (camera_weights.sum(dim=1, keepdim=True) + 1e-6)
+            feature4prediction = feature4prediction * camera_weights.view(b, n, 1, 1, 1)
 
         epoch = self._get_current_epoch()
         self._maybe_apply_calibration_error(epoch)
@@ -783,12 +803,6 @@ class PerspTransDetector(nn.Module):
             world_features.append(world_feature.to('cuda:0'))
         world_features = torch.cat(world_features, dim=1)
         camera_token_mask = camera_keep_mask.unsqueeze(-1).repeat(1, 1, self.tau_1 + 1).reshape(b, -1)
-
-        if self.method == 'baseline_refined' and self.refine_soft_weighting:
-            masked_score = camera_score.masked_fill(camera_keep_mask < 0.5, float('-inf'))
-            camera_weights = torch.softmax(masked_score, dim=1) * camera_keep_mask
-            camera_weights = camera_weights / (camera_weights.sum(dim=1, keepdim=True) + 1e-6)
-            feature4prediction = feature4prediction * camera_weights.view(b, n, 1, 1, 1)
 
         if self.enable_map_visual_dump:
             self.save_map_result_images(world_features, self.coord_map, os.path.join('temp', 'map_res'))
@@ -823,7 +837,9 @@ class PerspTransDetector(nn.Module):
         if not self.training:
             map_results = []
             for cam_num in range(self.num_cam):
-                cam_feature = world_features[:, cam_num, :, :].unsqueeze(1)
+                start = cam_num * self.channel * (self.tau_1 + 1)
+                end = start + self.channel * (self.tau_1 + 1)
+                cam_feature = world_features[:, start:end, :, :]
                 map_result_single = self.process_features_with_temporal_fusion(
                     cam_feature,
                     self.coord_map,
