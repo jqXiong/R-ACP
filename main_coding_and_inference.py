@@ -74,6 +74,14 @@ def _save_checkpoint(path, model, optimizer, epoch, args, metrics=None):
     torch.save(payload, path)
 
 
+def _get_effective_train_epochs(args):
+    if args.train_epochs > 0:
+        return min(args.train_epochs, args.epochs)
+    if args.method == 'baseline':
+        return min(10, args.epochs)
+    return args.epochs
+
+
 def main(args):
     # seed
     if args.seed is not None:
@@ -104,7 +112,7 @@ def main(args):
     # model
     model = PerspTransDetector(train_set, args)
 
-    effective_train_epochs = args.epochs if args.train_epochs <= 0 else min(args.train_epochs, args.epochs)
+    effective_train_epochs = _get_effective_train_epochs(args)
     optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=args.lr, steps_per_epoch=len(train_loader),
                                                     epochs=effective_train_epochs)
@@ -242,7 +250,14 @@ if __name__ == '__main__':
     parser.add_argument('--dataset_path', type=str, default='./Data/Wildtrack')
     parser.add_argument('--model_path', type=str, default="")
     parser.add_argument('--drop_prob', type=float, default=1e-1) # for random drop frame
-    parser.add_argument('--method', type=str, default='baseline', choices=['baseline', 'proposed_jscc'])
+    parser.add_argument('--method', type=str, default='baseline', choices=['baseline', 'baseline_refined', 'proposed_jscc'])
+    parser.add_argument('--refine_keep_cameras', type=int, default=-1)
+    parser.add_argument('--refine_keep_ratio', type=float, default=1.0)
+    parser.add_argument('--refine_min_keep_cameras', type=int, default=1)
+    parser.add_argument('--refine_score_mode', type=str, default='current', choices=['current', 'current_temporal', 'current_temporal_uncertainty'])
+    parser.add_argument('--refine_score_noise_std', type=float, default=0.0)
+    parser.add_argument('--refine_weighted_entropy', action='store_true')
+    parser.add_argument('--refine_enable_token_drop', action='store_true')
     parser.add_argument('--disable_quantization', action='store_true')
     parser.add_argument('--jscc_channel_type', type=str, default='rayleigh', choices=['awgn', 'rayleigh'])
     parser.add_argument('--jscc_latent_channels', type=int, default=-1)
