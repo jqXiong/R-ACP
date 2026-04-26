@@ -261,6 +261,29 @@ class EnhancedMapHead(nn.Module):
         return self.merge(torch.cat([b1, b2, b4], dim=1))
 
 
+class RefinedCameraSelector(nn.Module):
+    def __init__(self, feature_channels, hidden_dim=64):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(feature_channels * 2 + 2, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.score_head = nn.Linear(hidden_dim, 1)
+        self.scale_head = nn.Sequential(
+            nn.Linear(hidden_dim, feature_channels),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, current_stats, history_stats, uncertainty_stats, keep_ratio_stats):
+        x = torch.cat([current_stats, history_stats, uncertainty_stats, keep_ratio_stats], dim=-1)
+        hidden = self.mlp(x)
+        score = self.score_head(hidden).squeeze(-1)
+        scale = 0.75 + 0.5 * self.scale_head(hidden)
+        return score, scale
+
+
 class PerspTransDetector(nn.Module):
     def __init__(self, dataset, args):
         super().__init__()
@@ -340,6 +363,7 @@ class PerspTransDetector(nn.Module):
             num_cam=self.num_cam,
             tau_1=self.tau_1,
         ).to('cuda:0')
+        self.refined_selector = RefinedCameraSelector(self.channel).to('cuda:0')
 
         self.proposed_tx_channels = (self.tau_1 + 1) * self.channel
         if self.method == 'proposed_jscc':
@@ -377,9 +401,24 @@ class PerspTransDetector(nn.Module):
         checkpoint = torch.load(pretrained_model_path, map_location='cpu')
         model_dict = checkpoint['model'] if isinstance(checkpoint, dict) and 'model' in checkpoint else checkpoint
 
+        has_full_detector_weights = any(
+            k.startswith('temporal_entropy_model')
+            or k.startswith('temporal_fusion_module')
+            or k.startswith('proposed_jscc')
+            or k.startswith('proposed_cross_view')
+            or k.startswith('proposed_map_head')
+            for k in model_dict
+        )
+
         if self.method == 'proposed_jscc':
             missing_keys, unexpected_keys = self.load_state_dict(model_dict, strict=False)
             print(f"Loaded checkpoint from {pretrained_model_path}")
+            print(f"Checkpoint load summary: missing={len(missing_keys)}, unexpected={len(unexpected_keys)}")
+            return
+
+        if has_full_detector_weights:
+            missing_keys, unexpected_keys = self.load_state_dict(model_dict, strict=False)
+            print(f"Loaded full baseline/refined checkpoint from {pretrained_model_path}")
             print(f"Checkpoint load summary: missing={len(missing_keys)}, unexpected={len(unexpected_keys)}")
             return
 
@@ -512,32 +551,49 @@ class PerspTransDetector(nn.Module):
             keep_count = self.num_cam
         return max(1, min(self.num_cam, max(self.refine_min_keep_cameras, keep_count)))
 
+    def _pool_refined_stats(self, current_features, history_features, scales_hat):
+        current_stats = current_features.abs().mean(dim=(3, 4))
+        history_stats = history_features.abs().mean(dim=(3, 4)).mean(dim=2)
+        uncertainty_stats = scales_hat.abs().mean(dim=(3, 4))
+        current_scalar = current_stats.mean(dim=2, keepdim=True)
+        history_scalar = history_stats.mean(dim=2, keepdim=True)
+        uncertainty_scalar = uncertainty_stats.mean(dim=2, keepdim=True)
+        keep_ratio_stats = torch.cat([current_scalar - history_scalar, uncertainty_scalar], dim=2)
+        return current_scalar, history_scalar, uncertainty_scalar, keep_ratio_stats
+
     def _build_refined_camera_mask(self, current_features, history_features, scales_hat):
         b, n = current_features.shape[:2]
         keep_count = self._resolve_refine_keep_count()
-        if keep_count >= n:
-            mask = torch.ones(b, n, device=current_features.device, dtype=current_features.dtype)
-            score = current_features.abs().mean(dim=(2, 3, 4))
-            return mask, score
+        current_scalar, history_scalar, uncertainty_scalar, keep_ratio_stats = self._pool_refined_stats(
+            current_features,
+            history_features,
+            scales_hat,
+        )
+        score, scale = self.refined_selector(
+            current_scalar,
+            history_scalar,
+            uncertainty_scalar,
+            keep_ratio_stats,
+        )
 
-        current_score = current_features.abs().mean(dim=(2, 3, 4))
-        score = current_score
-
-        if self.refine_score_mode in {'current_temporal', 'current_temporal_uncertainty'}:
-            temporal_score = history_features.abs().mean(dim=(2, 3, 4))
-            score = score + 0.35 * temporal_score
-
-        if self.refine_score_mode == 'current_temporal_uncertainty':
-            uncertainty_score = 1.0 / (scales_hat.abs().mean(dim=(2, 3, 4)) + 0.5)
-            score = score + 0.15 * uncertainty_score
+        if self.refine_score_mode == 'current':
+            score = score + current_scalar.squeeze(-1)
+        elif self.refine_score_mode == 'current_temporal':
+            score = score + current_scalar.squeeze(-1) + 0.35 * history_scalar.squeeze(-1)
+        else:
+            score = score + current_scalar.squeeze(-1) + 0.35 * history_scalar.squeeze(-1) - 0.15 * uncertainty_scalar.squeeze(-1)
 
         if self.training and self.refine_score_noise_std > 0:
             score = score + torch.randn_like(score) * self.refine_score_noise_std
 
+        if keep_count >= n:
+            mask = torch.ones(b, n, device=current_features.device, dtype=current_features.dtype)
+            return mask, score, scale
+
         top_idx = torch.topk(score, k=keep_count, dim=1, largest=True).indices
         mask = torch.zeros(b, n, device=current_features.device, dtype=current_features.dtype)
         mask.scatter_(1, top_idx, 1.0)
-        return mask, score
+        return mask, score, scale
 
     def forward_proposed(self, imgs_list):
         b, t, n, c, h, w = imgs_list.shape
@@ -676,7 +732,7 @@ class PerspTransDetector(nn.Module):
         gaussian_params = torch.reshape(gaussian_params, (b, n, 2 * self.channel, 90, 160))
         scales_hat, means_hat = gaussian_params.chunk(2, dim=2)
         if self.method == 'baseline_refined':
-            camera_keep_mask, camera_score = self._build_refined_camera_mask(
+            camera_keep_mask, camera_score, camera_scale = self._build_refined_camera_mask(
                 to_be_transmitted_feature,
                 conditional_features,
                 scales_hat,
@@ -684,6 +740,7 @@ class PerspTransDetector(nn.Module):
         else:
             camera_keep_mask = torch.ones(b, n, device=to_be_transmitted_feature.device, dtype=to_be_transmitted_feature.dtype)
             camera_score = camera_keep_mask
+            camera_scale = torch.ones(b, n, self.channel, device=to_be_transmitted_feature.device, dtype=to_be_transmitted_feature.dtype)
 
         likelihood_input = to_be_transmitted_feature
         if self.method == 'baseline_refined':
@@ -700,6 +757,8 @@ class PerspTransDetector(nn.Module):
         feature4prediction = torch.swapaxes(feature4prediction, 1, 2)
         if self.method == 'baseline_refined':
             feature4prediction = feature4prediction * camera_keep_mask.view(b, n, 1, 1, 1, 1)
+            repeated_scale = camera_scale.repeat_interleave(self.tau_1 + 1, dim=2).view(b, n, self.tau_1 + 1, self.channel, 1, 1)
+            feature4prediction = feature4prediction * repeated_scale
         feature4prediction = torch.reshape(feature4prediction, (b, n, (self.tau_1 + 1) * self.channel, 90, 160))
         feature4prediction = torch.reshape(feature4prediction, (b * n, (self.tau_1 + 1) * self.channel, 90, 160))
         feature4prediction = F.interpolate(feature4prediction, size=self.upsample_shape, mode='bilinear')

@@ -9,4 +9,4 @@ TAU1="${TAU1:-2}"
 TAU2="${TAU2:-2}"
 BATCH="${BATCH:-1}"
 
-"${PYTHON_BIN}" main_coding_and_inference.py --dataset_path "${DATASET_PATH}" --model_path "${INIT_MODEL_PATH}" --epochs "${EPOCHS}" --train_epochs "${EPOCHS}" --batch_size "${BATCH}" --tau_1 "${TAU1}" --tau_2 "${TAU2}" --method baseline_refined --refine_keep_cameras 6 --refine_weighted_entropy --save_prefix abl_4_refined_prune_masked --exp_name train_abl_4_refined_prune_masked
+"${PYTHON_BIN}" main_coding_and_inference.py --dataset_path "${DATASET_PATH}" --model_path "${INIT_MODEL_PATH}" --epochs "${EPOCHS}" --train_epochs "${EPOCHS}" --batch_size "${BATCH}" --tau_1 "${TAU1}" --tau_2 "${TAU2}" --method baseline_refined --refine_keep_cameras 6 --refine_score_mode current_temporal --refine_weighted_entropy --save_prefix abl_4_refined_prune_masked --exp_name train_abl_4_refined_prune_masked
