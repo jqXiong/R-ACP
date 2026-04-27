@@ -265,6 +265,7 @@ if __name__ == '__main__':
     parser.add_argument('--refine_apply_entropy_scale', action='store_true')
     parser.add_argument('--refine_channel_keep_ratio', type=float, default=1.0)
     parser.add_argument('--refine_channel_min_keep', type=int, default=1)
+    parser.add_argument('--refine_channel_drop_floor', type=float, default=0.0)
     parser.add_argument('--disable_quantization', action='store_true')
     parser.add_argument('--jscc_channel_type', type=str, default='rayleigh', choices=['awgn', 'rayleigh'])
     parser.add_argument('--jscc_latent_channels', type=int, default=-1)

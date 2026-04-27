@@ -315,6 +315,7 @@ class PerspTransDetector(nn.Module):
         self.refine_apply_entropy_scale = getattr(args, 'refine_apply_entropy_scale', False)
         self.refine_channel_keep_ratio = getattr(args, 'refine_channel_keep_ratio', 1.0)
         self.refine_channel_min_keep = getattr(args, 'refine_channel_min_keep', 1)
+        self.refine_channel_drop_floor = getattr(args, 'refine_channel_drop_floor', 0.0)
 
         self.jscc_channel_type = getattr(args, 'jscc_channel_type', 'rayleigh')
         self.snr_min_db = getattr(args, 'snr_min_db', 0.0)
@@ -656,6 +657,8 @@ class PerspTransDetector(nn.Module):
         top_idx = torch.topk(camera_scale, k=keep_channels, dim=2, largest=True).indices
         channel_mask = torch.zeros_like(camera_scale)
         channel_mask.scatter_(2, top_idx, 1.0)
+        if self.refine_channel_drop_floor > 0:
+            channel_mask = channel_mask + (1.0 - channel_mask) * self.refine_channel_drop_floor
         return channel_mask
 
     def forward_proposed(self, imgs_list):
