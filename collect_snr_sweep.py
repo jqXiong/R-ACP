@@ -89,27 +89,43 @@ def main():
     parser.add_argument('--pareto_csv', type=str, default='logs/snr_sweep_pareto.csv')
     parser.add_argument('--summary_csv', type=str, default='logs/snr_sweep_variant_summary.csv')
     parser.add_argument('--tags', type=str, default='abl_1_baseline,abl_2_refined_baseline,abl_3_refined_prune,abl_4_refined_prune_masked,abl_5_refined_temporal,abl_6_refined_adaptive')
+    parser.add_argument('--run_dir', type=str, default='', help='explicit run dir to ingest; overrides tag-based directory search when provided')
+    parser.add_argument('--variant_name', type=str, default='', help='variant name to use with --run_dir; defaults to run dir suffix')
     parser.add_argument('--epoch', type=int, default=-1, help='target epoch; -1 means latest epoch file in each run')
     parser.add_argument('--merge_existing', action='store_true', help='merge into existing summary csv and replace rows for requested tags only')
     args = parser.parse_args()
 
     logs_dir = Path(args.logs_dir)
     tags = [t.strip() for t in args.tags.split(',') if t.strip()]
+    if args.run_dir:
+        explicit_variant = args.variant_name.strip() if args.variant_name.strip() else Path(args.run_dir).name.split('_', 3)[-1]
+        tags = [explicit_variant]
 
     output_path = Path(args.output_csv)
     pareto_path = Path(args.pareto_csv)
     summary_path = Path(args.summary_csv)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    existing_rows = read_summary_csv(output_path) if args.merge_existing else []
+    existing_by_variant = defaultdict(list)
+    for row in existing_rows:
+        existing_by_variant[row['variant']].append(row)
+
     summary_rows = []
-    if args.merge_existing:
-        existing_rows = read_summary_csv(output_path)
-        requested_tags = set(tags)
-        summary_rows.extend([r for r in existing_rows if r['variant'] not in requested_tags])
+    collected_tags = set()
 
     for tag in tags:
-        run_dirs = sorted([p for p in logs_dir.glob(f'*_{tag}') if p.is_dir()])
+        if args.run_dir:
+            run_dir = Path(args.run_dir)
+            run_dirs = [run_dir] if run_dir.is_dir() else []
+        else:
+            run_dirs = sorted([p for p in logs_dir.glob(f'*_{tag}') if p.is_dir()])
         if not run_dirs:
+            if args.merge_existing and tag in existing_by_variant:
+                summary_rows.extend(existing_by_variant[tag])
+                print(f'[merge_existing] no run dir found for {tag}, kept {len(existing_by_variant[tag])} existing rows')
+            else:
+                print(f'[warn] no run dir found for {tag}')
             continue
         run_dir = run_dirs[-1]
 
@@ -118,10 +134,16 @@ def main():
         else:
             candidates = sorted(run_dir.glob('snr_sweep_epoch_*.csv'))
         if not candidates:
+            if args.merge_existing and tag in existing_by_variant:
+                summary_rows.extend(existing_by_variant[tag])
+                print(f'[merge_existing] no snr csv found for {tag} in {run_dir}, kept {len(existing_by_variant[tag])} existing rows')
+            else:
+                print(f'[warn] no snr csv found for {tag} in {run_dir}')
             continue
 
         csv_path = candidates[-1]
         epoch_str = csv_path.stem.replace('snr_sweep_epoch_', '')
+        collected_tags.add(tag)
 
         for row in read_snr_csv(csv_path):
             summary_rows.append({
@@ -137,6 +159,12 @@ def main():
                 'eval_recall': row['eval_recall'],
                 'comm_kb': row['comm_kb'],
             })
+
+    if args.merge_existing:
+        requested_tags = set(tags)
+        untouched_tags = set(existing_by_variant.keys()) - requested_tags
+        for tag in untouched_tags:
+            summary_rows.extend(existing_by_variant[tag])
 
     headers = ['variant', 'run_dir', 'epoch', 'snr_db', 'test_loss', 'test_prec', 'moda', 'modp', 'eval_precision', 'eval_recall', 'comm_kb']
     with output_path.open('w', encoding='utf-8', newline='') as f:
