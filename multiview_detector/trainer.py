@@ -223,15 +223,20 @@ class PerspectiveTrainer(BaseTrainer):
         print('test gt losses', losses, 'statistic', output_map_res_statistic)
 
         if res_fpath is not None:
-            all_res_list = torch.cat(all_res_list, dim=0)
-            np.savetxt(os.path.join(base_dir, 'all_res.txt'), all_res_list.numpy(), '%.8f')
-            res_list = []
-            for frame_num in np.unique(all_res_list[:, 0]):
-                res = all_res_list[all_res_list[:, 0] == frame_num, :]
-                positions, scores = res[:, 1:3], res[:, 3]
-                ids, count = nms(positions, scores, 20, np.inf)
-                res_list.append(torch.cat([torch.ones([count, 1]) * frame_num, positions[ids[:count], :]], dim=1))
-            res_list = torch.cat(res_list, dim=0).numpy() if res_list else np.empty([0, 3])
+            if all_res_list:
+                all_res_list = torch.cat(all_res_list, dim=0)
+                np.savetxt(os.path.join(base_dir, 'all_res.txt'), all_res_list.numpy(), '%.8f')
+                res_list = []
+                for frame_num in np.unique(all_res_list[:, 0]):
+                    res = all_res_list[all_res_list[:, 0] == frame_num, :]
+                    positions, scores = res[:, 1:3], res[:, 3]
+                    ids, count = nms(positions, scores, 20, np.inf)
+                    res_list.append(torch.cat([torch.ones([count, 1]) * frame_num, positions[ids[:count], :]], dim=1))
+                res_list = torch.cat(res_list, dim=0).numpy() if res_list else np.empty([0, 3])
+            else:
+                empty_all_res = np.empty([0, 4], dtype=np.float32)
+                np.savetxt(os.path.join(base_dir, 'all_res.txt'), empty_all_res, '%.8f')
+                res_list = np.empty([0, 3], dtype=np.float32)
             np.savetxt(res_fpath, res_list, '%d')
 
             eval_recall, eval_precision, moda, modp = evaluate(os.path.abspath(res_fpath), os.path.abspath(gt_fpath),

@@ -614,7 +614,7 @@ class PerspTransDetector(nn.Module):
         else:
             keep_count = self.num_cam
         if self.refine_snr_aware and snr_db is not None and self.refine_low_snr_camera_bonus > 0:
-            severity = self._compute_snr_severity(snr_db)
+            severity = self._compute_snr_severity(snr_db).view(-1)
             bonus = torch.round(severity * self.refine_low_snr_camera_bonus).to(torch.int64)
             return (bonus + keep_count).clamp(
                 min=max(1, self.refine_min_keep_cameras),
@@ -710,8 +710,7 @@ class PerspTransDetector(nn.Module):
         keep_ratio = self.refine_channel_keep_ratio
         drop_floor = self.refine_channel_drop_floor
         if self.refine_snr_aware and snr_db is not None:
-            severity = self._compute_snr_severity(snr_db)
-            severity = severity.view(-1, 1, 1)
+            severity = self._compute_snr_severity(snr_db).view(-1, 1, 1)
             keep_ratio = (keep_ratio + self.refine_low_snr_channel_bonus * severity).clamp(0.0, 1.0)
             drop_floor = torch.maximum(
                 torch.full_like(severity, self.refine_channel_drop_floor),
@@ -734,6 +733,8 @@ class PerspTransDetector(nn.Module):
                 dtype=camera_scale.dtype,
             )
         else:
+            keep_ratio = keep_ratio.expand(-1, camera_scale.shape[1], -1)
+            drop_floor = drop_floor.expand(-1, camera_scale.shape[1], -1)
             keep_counts = torch.ceil(self.channel * keep_ratio.squeeze(-1)).to(torch.int64)
             drop_floor_tensor = drop_floor.to(dtype=camera_scale.dtype, device=camera_scale.device)
         keep_counts = keep_counts.clamp(min=self.refine_channel_min_keep, max=self.channel)
