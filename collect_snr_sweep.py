@@ -22,6 +22,29 @@ def read_snr_csv(path: Path):
     return rows
 
 
+def read_summary_csv(path: Path):
+    if not path.exists():
+        return []
+    rows = []
+    with path.open('r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            rows.append({
+                'variant': r['variant'],
+                'run_dir': r['run_dir'],
+                'epoch': int(r['epoch']),
+                'snr_db': float(r['snr_db']),
+                'test_loss': float(r.get('test_loss', 'nan')),
+                'test_prec': float(r.get('test_prec', 'nan')),
+                'moda': float(r.get('moda', 'nan')),
+                'modp': float(r.get('modp', 'nan')),
+                'eval_precision': float(r.get('eval_precision', 'nan')),
+                'eval_recall': float(r.get('eval_recall', 'nan')),
+                'comm_kb': float(r.get('comm_kb', 'nan')),
+            })
+    return rows
+
+
 def is_dominated(a, b):
     return (b['moda'] >= a['moda'] and b['comm_kb'] <= a['comm_kb']) and (
         b['moda'] > a['moda'] or b['comm_kb'] < a['comm_kb']
@@ -67,6 +90,7 @@ def main():
     parser.add_argument('--summary_csv', type=str, default='logs/snr_sweep_variant_summary.csv')
     parser.add_argument('--tags', type=str, default='abl_1_baseline,abl_2_refined_baseline,abl_3_refined_prune,abl_4_refined_prune_masked,abl_5_refined_temporal,abl_6_refined_adaptive')
     parser.add_argument('--epoch', type=int, default=-1, help='target epoch; -1 means latest epoch file in each run')
+    parser.add_argument('--merge_existing', action='store_true', help='merge into existing summary csv and replace rows for requested tags only')
     args = parser.parse_args()
 
     logs_dir = Path(args.logs_dir)
@@ -78,6 +102,10 @@ def main():
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     summary_rows = []
+    if args.merge_existing:
+        existing_rows = read_summary_csv(output_path)
+        requested_tags = set(tags)
+        summary_rows.extend([r for r in existing_rows if r['variant'] not in requested_tags])
 
     for tag in tags:
         run_dirs = sorted([p for p in logs_dir.glob(f'*_{tag}') if p.is_dir()])
