@@ -316,6 +316,15 @@ class PerspTransDetector(nn.Module):
         self.refine_channel_keep_ratio = getattr(args, 'refine_channel_keep_ratio', 1.0)
         self.refine_channel_min_keep = getattr(args, 'refine_channel_min_keep', 1)
         self.refine_channel_drop_floor = getattr(args, 'refine_channel_drop_floor', 0.0)
+        self.refine_snr_aware = getattr(args, 'refine_snr_aware', False)
+        self.refine_snr_reference_db = getattr(args, 'refine_snr_reference_db', 10.0)
+        self.refine_low_snr_camera_bonus = getattr(args, 'refine_low_snr_camera_bonus', 0)
+        self.refine_low_snr_channel_bonus = getattr(args, 'refine_low_snr_channel_bonus', 0.0)
+        self.refine_low_snr_drop_floor = getattr(args, 'refine_low_snr_drop_floor', 0.0)
+        self.refine_low_snr_scale_boost = getattr(args, 'refine_low_snr_scale_boost', 0.0)
+        self.refine_use_cross_view_fusion = getattr(args, 'refine_use_cross_view_fusion', False)
+        self.refine_use_bev_attention = getattr(args, 'refine_use_bev_attention', False)
+        self.refine_strong_head_weight = getattr(args, 'refine_strong_head_weight', 0.0)
 
         self.jscc_channel_type = getattr(args, 'jscc_channel_type', 'rayleigh')
         self.snr_min_db = getattr(args, 'snr_min_db', 0.0)
@@ -373,13 +382,21 @@ class PerspTransDetector(nn.Module):
             num_cam=self.num_cam,
             tau_1=self.tau_1,
         ).to('cuda:0')
+        self.proposed_tx_channels = (self.tau_1 + 1) * self.channel
         self.refined_selector = RefinedCameraSelector(
             self.channel,
             scale_min=self.refine_scale_min,
             scale_max=self.refine_scale_max,
         ).to('cuda:0')
+        if self.method == 'baseline_refined' and self.refine_use_cross_view_fusion:
+            if self.refine_use_bev_attention:
+                self.refine_bev_attention = ChannelAttention(self.proposed_tx_channels).to('cuda:0')
+            self.refine_cross_view = SNRGuidedCrossViewFusion(
+                channels=self.proposed_tx_channels,
+                num_heads=self.cross_view_heads,
+            ).to('cuda:0')
+            self.refine_map_head = EnhancedMapHead(self.proposed_tx_channels + 2).to('cuda:0')
 
-        self.proposed_tx_channels = (self.tau_1 + 1) * self.channel
         if self.method == 'proposed_jscc':
             proposed_latent_channels = getattr(args, 'jscc_latent_channels', -1)
             if proposed_latent_channels <= 0:
@@ -583,13 +600,26 @@ class PerspTransDetector(nn.Module):
         if self.enable_calibration_error and (not self.training) and epoch > self.epoch_thres:
             print("Updated projection matrices for testing phase.")
 
-    def _resolve_refine_keep_count(self):
+    def _compute_snr_severity(self, snr_db):
+        if snr_db is None:
+            return None
+        severity = (self.refine_snr_reference_db - snr_db) / max(abs(self.refine_snr_reference_db) + 5.0, 1.0)
+        return severity.clamp(0.0, 1.0)
+
+    def _resolve_refine_keep_count(self, snr_db=None):
         if self.refine_keep_cameras > 0:
             keep_count = min(self.num_cam, self.refine_keep_cameras)
         elif self.refine_keep_ratio < 1.0:
             keep_count = int(math.ceil(self.num_cam * self.refine_keep_ratio))
         else:
             keep_count = self.num_cam
+        if self.refine_snr_aware and snr_db is not None and self.refine_low_snr_camera_bonus > 0:
+            severity = self._compute_snr_severity(snr_db)
+            bonus = torch.round(severity * self.refine_low_snr_camera_bonus).to(torch.int64)
+            return (bonus + keep_count).clamp(
+                min=max(1, self.refine_min_keep_cameras),
+                max=self.num_cam,
+            )
         return max(1, min(self.num_cam, max(self.refine_min_keep_cameras, keep_count)))
 
     def _pool_refined_stats(self, current_features, history_features, scales_hat):
@@ -612,9 +642,9 @@ class PerspTransDetector(nn.Module):
         aux_stats = torch.cat([current_scalar - history_scalar, uncertainty_scalar], dim=2)
         return current_stats, history_stats, uncertainty_stats, aux_stats
 
-    def _build_refined_camera_mask(self, current_features, history_features, scales_hat):
+    def _build_refined_camera_mask(self, current_features, history_features, scales_hat, snr_db=None):
         b, n = current_features.shape[:2]
-        keep_count = self._resolve_refine_keep_count()
+        keep_count = self._resolve_refine_keep_count(snr_db)
         current_stats, history_stats, uncertainty_stats, aux_stats = self._pool_refined_stats(
             current_features,
             history_features,
@@ -626,6 +656,13 @@ class PerspTransDetector(nn.Module):
             uncertainty_stats,
             aux_stats,
         )
+        if self.refine_snr_aware and snr_db is not None and self.refine_low_snr_scale_boost > 0:
+            severity = self._compute_snr_severity(snr_db).view(b, 1, 1)
+            low_snr_floor = (self.refine_scale_max - self.refine_low_snr_scale_boost * severity).clamp(
+                min=self.refine_scale_min,
+                max=self.refine_scale_max,
+            )
+            scale = torch.maximum(scale, low_snr_floor)
         current_scalar = current_stats.mean(dim=2)
         history_scalar = history_stats.mean(dim=2)
         uncertainty_scalar = uncertainty_stats.mean(dim=2)
@@ -640,39 +677,75 @@ class PerspTransDetector(nn.Module):
         if self.training and self.refine_score_noise_std > 0:
             score = score + torch.randn_like(score) * self.refine_score_noise_std
 
-        if keep_count >= n:
+        if isinstance(keep_count, int) and keep_count >= n:
             mask = torch.ones(b, n, device=current_features.device, dtype=current_features.dtype)
             return mask, score, scale
 
-        extra_slot = 1 if self.refine_adaptive_keep_margin > 0 and keep_count < n else 0
-        top_count = min(n, keep_count + extra_slot)
+        if isinstance(keep_count, int):
+            keep_count_tensor = torch.full((b,), keep_count, device=current_features.device, dtype=torch.int64)
+        else:
+            keep_count_tensor = keep_count.to(device=current_features.device, dtype=torch.int64)
+        max_keep = int(keep_count_tensor.max().item())
+        extra_slot = 1 if self.refine_adaptive_keep_margin > 0 and max_keep < n else 0
+        top_count = min(n, max_keep + extra_slot)
         top_scores, top_idx = torch.topk(score, k=top_count, dim=1, largest=True)
         mask = torch.zeros(b, n, device=current_features.device, dtype=current_features.dtype)
-        mask.scatter_(1, top_idx[:, :keep_count], 1.0)
+        for bi in range(b):
+            cur_keep = int(keep_count_tensor[bi].item())
+            mask[bi].scatter_(0, top_idx[bi, :cur_keep], 1.0)
         if extra_slot:
-            score_gap = top_scores[:, keep_count - 1] - top_scores[:, keep_count]
+            gap_left_idx = (keep_count_tensor - 1).clamp(min=0)
+            gap_right_idx = keep_count_tensor.clamp(max=top_count - 1)
+            row_ids = torch.arange(b, device=current_features.device)
+            score_gap = top_scores[row_ids, gap_left_idx] - top_scores[row_ids, gap_right_idx]
             rescue_rows = score_gap < self.refine_adaptive_keep_margin
             if rescue_rows.any():
                 rescue_batch_idx = rescue_rows.nonzero(as_tuple=False).squeeze(1)
-                rescue_cam_idx = top_idx[rescue_rows, keep_count]
+                rescue_pos = keep_count_tensor[rescue_rows].clamp(max=top_count - 1)
+                rescue_cam_idx = top_idx[rescue_batch_idx, rescue_pos]
                 mask[rescue_batch_idx, rescue_cam_idx] = 1.0
         return mask, score, scale
 
-    def _build_refined_channel_mask(self, camera_scale):
-        if self.refine_channel_keep_ratio >= 1.0:
+    def _build_refined_channel_mask(self, camera_scale, snr_db=None):
+        keep_ratio = self.refine_channel_keep_ratio
+        drop_floor = self.refine_channel_drop_floor
+        if self.refine_snr_aware and snr_db is not None:
+            severity = self._compute_snr_severity(snr_db)
+            severity = severity.view(-1, 1, 1)
+            keep_ratio = (keep_ratio + self.refine_low_snr_channel_bonus * severity).clamp(0.0, 1.0)
+            drop_floor = torch.maximum(
+                torch.full_like(severity, self.refine_channel_drop_floor),
+                severity * self.refine_low_snr_drop_floor,
+            )
+        if isinstance(keep_ratio, float) and keep_ratio >= 1.0:
             return torch.ones_like(camera_scale)
-
-        keep_channels = int(math.ceil(self.channel * self.refine_channel_keep_ratio))
-        keep_channels = max(self.refine_channel_min_keep, keep_channels)
-        keep_channels = min(self.channel, keep_channels)
-        if keep_channels >= self.channel:
-            return torch.ones_like(camera_scale)
-
-        top_idx = torch.topk(camera_scale, k=keep_channels, dim=2, largest=True).indices
         channel_mask = torch.zeros_like(camera_scale)
-        channel_mask.scatter_(2, top_idx, 1.0)
-        if self.refine_channel_drop_floor > 0:
-            channel_mask = channel_mask + (1.0 - channel_mask) * self.refine_channel_drop_floor
+        if isinstance(keep_ratio, float):
+            keep_counts = torch.full(
+                (camera_scale.shape[0], camera_scale.shape[1]),
+                int(math.ceil(self.channel * keep_ratio)),
+                device=camera_scale.device,
+                dtype=torch.int64,
+            )
+            drop_floor_tensor = torch.full(
+                (camera_scale.shape[0], camera_scale.shape[1], 1),
+                drop_floor,
+                device=camera_scale.device,
+                dtype=camera_scale.dtype,
+            )
+        else:
+            keep_counts = torch.ceil(self.channel * keep_ratio.squeeze(-1)).to(torch.int64)
+            drop_floor_tensor = drop_floor.to(dtype=camera_scale.dtype, device=camera_scale.device)
+        keep_counts = keep_counts.clamp(min=self.refine_channel_min_keep, max=self.channel)
+        for bi in range(camera_scale.shape[0]):
+            for ni in range(camera_scale.shape[1]):
+                keep_channels = int(keep_counts[bi, ni].item())
+                if keep_channels >= self.channel:
+                    channel_mask[bi, ni].fill_(1.0)
+                    continue
+                top_idx = torch.topk(camera_scale[bi, ni], k=keep_channels, dim=0, largest=True).indices
+                channel_mask[bi, ni].scatter_(0, top_idx, 1.0)
+        channel_mask = channel_mask + (1.0 - channel_mask) * drop_floor_tensor
         return channel_mask
 
     def forward_proposed(self, imgs_list):
@@ -807,6 +880,7 @@ class PerspTransDetector(nn.Module):
         conditional_features = torch.swapaxes(conditional_features, 1, 2)
         conditional_features = torch.reshape(conditional_features, (b, n, self.tau_2 * self.channel, 90, 160))
         conditional_features_flat = torch.reshape(conditional_features, (b * n, self.tau_2 * self.channel, 90, 160))
+        snr_db = self.sample_snr_db(b, conditional_features.device)
 
         gaussian_params = self.temporal_entropy_model(conditional_features_flat)
         gaussian_params = torch.reshape(gaussian_params, (b, n, 2 * self.channel, 90, 160))
@@ -816,8 +890,9 @@ class PerspTransDetector(nn.Module):
                 to_be_transmitted_feature,
                 conditional_features,
                 scales_hat,
+                snr_db=snr_db,
             )
-            channel_keep_mask = self._build_refined_channel_mask(camera_scale)
+            channel_keep_mask = self._build_refined_channel_mask(camera_scale, snr_db=snr_db)
         else:
             camera_keep_mask = torch.ones(b, n, device=to_be_transmitted_feature.device, dtype=to_be_transmitted_feature.dtype)
             camera_score = camera_keep_mask
@@ -848,7 +923,6 @@ class PerspTransDetector(nn.Module):
             feature4prediction = feature4prediction * repeated_channel_mask
             repeated_scale = camera_scale.repeat_interleave(self.tau_1 + 1, dim=2).view(b, n, self.tau_1 + 1, self.channel, 1, 1)
             feature4prediction = feature4prediction * repeated_scale
-        snr_db = self.sample_snr_db(b, feature4prediction.device)
         feature4prediction = self.apply_feature_channel(feature4prediction, snr_db)
         feature4prediction = torch.reshape(feature4prediction, (b, n, (self.tau_1 + 1) * self.channel, 90, 160))
         feature4prediction = torch.reshape(feature4prediction, (b * n, (self.tau_1 + 1) * self.channel, 90, 160))
@@ -905,24 +979,53 @@ class PerspTransDetector(nn.Module):
             expanded_mask = mask.unsqueeze(2).repeat(1, 1, self.channel).view(b, world_features.shape[1], 1, 1)
             world_features = world_features * expanded_mask
 
+        strong_map_result = None
+        strong_map_results = None
+        if self.method == 'baseline_refined' and self.refine_use_cross_view_fusion:
+            bev_views = world_features.view(
+                b, self.num_cam, self.proposed_tx_channels, self.reducedgrid_shape[0], self.reducedgrid_shape[1]
+            )
+            if self.refine_use_bev_attention:
+                bev_views = self.refine_bev_attention(
+                    bev_views.view(b * self.num_cam, self.proposed_tx_channels, self.reducedgrid_shape[0], self.reducedgrid_shape[1])
+                ).view(b, self.num_cam, self.proposed_tx_channels, self.reducedgrid_shape[0], self.reducedgrid_shape[1])
+            snr_norm = (snr_db / 20.0).clamp(-1.5, 1.5)
+            view_reliability = torch.stack(
+                [snr_norm.repeat(1, self.num_cam), camera_keep_mask, torch.sigmoid(camera_score)],
+                dim=-1,
+            )
+            fused_bev, _, _ = self.refine_cross_view(bev_views, snr_db, view_reliability=view_reliability)
+            coord = self.coord_map.repeat([b, 1, 1, 1]).to('cuda:0')
+            strong_map_result = self.refine_map_head(torch.cat([fused_bev, coord], dim=1))
+            if not self.training:
+                strong_map_list = []
+                for cam_num in range(self.num_cam):
+                    strong_map_list.append(self.refine_map_head(torch.cat([bev_views[:, cam_num], coord], dim=1)))
+                strong_map_results = torch.cat(strong_map_list, dim=1)
+
         world_features = torch.cat([world_features, self.coord_map.repeat([b, 1, 1, 1]).to('cuda:0')], dim=1)
         map_result = self.temporal_fusion_module(world_features, mask)
+        if strong_map_result is not None and self.refine_strong_head_weight > 0:
+            map_result = (1.0 - self.refine_strong_head_weight) * map_result + self.refine_strong_head_weight * strong_map_result
         bits_loss = bits_loss / 8 / 1024
 
         if not self.training:
-            map_results = []
-            for cam_num in range(self.num_cam):
-                start = cam_num * self.channel * (self.tau_1 + 1)
-                end = start + self.channel * (self.tau_1 + 1)
-                cam_feature = world_features[:, start:end, :, :]
-                map_result_single = self.process_features_with_temporal_fusion(
-                    cam_feature,
-                    self.coord_map,
-                    cam_idx=cam_num,
-                    is_training=self.training,
-                )
-                map_results.append(map_result_single)
-            map_results = torch.cat(map_results, dim=1)
+            if strong_map_results is not None and self.refine_strong_head_weight > 0:
+                map_results = strong_map_results
+            else:
+                map_results = []
+                for cam_num in range(self.num_cam):
+                    start = cam_num * self.channel * (self.tau_1 + 1)
+                    end = start + self.channel * (self.tau_1 + 1)
+                    cam_feature = world_features[:, start:end, :, :]
+                    map_result_single = self.process_features_with_temporal_fusion(
+                        cam_feature,
+                        self.coord_map,
+                        cam_idx=cam_num,
+                        is_training=self.training,
+                    )
+                    map_results.append(map_result_single)
+                map_results = torch.cat(map_results, dim=1)
         else:
             map_results = torch.zeros(b, self.num_cam, h, w, device=world_features.device)
 
