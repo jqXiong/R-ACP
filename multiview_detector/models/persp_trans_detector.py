@@ -307,6 +307,7 @@ class PerspTransDetector(nn.Module):
         self.refine_weighted_entropy = getattr(args, 'refine_weighted_entropy', False)
         self.refine_enable_token_drop = getattr(args, 'refine_enable_token_drop', False)
         self.refine_soft_weighting = getattr(args, 'refine_soft_weighting', False)
+        self.refine_adaptive_keep_margin = getattr(args, 'refine_adaptive_keep_margin', 0.0)
 
         self.jscc_channel_type = getattr(args, 'jscc_channel_type', 'rayleigh')
         self.snr_min_db = getattr(args, 'snr_min_db', 0.0)
@@ -617,9 +618,18 @@ class PerspTransDetector(nn.Module):
             mask = torch.ones(b, n, device=current_features.device, dtype=current_features.dtype)
             return mask, score, scale
 
-        top_idx = torch.topk(score, k=keep_count, dim=1, largest=True).indices
+        extra_slot = 1 if self.refine_adaptive_keep_margin > 0 and keep_count < n else 0
+        top_count = min(n, keep_count + extra_slot)
+        top_scores, top_idx = torch.topk(score, k=top_count, dim=1, largest=True)
         mask = torch.zeros(b, n, device=current_features.device, dtype=current_features.dtype)
-        mask.scatter_(1, top_idx, 1.0)
+        mask.scatter_(1, top_idx[:, :keep_count], 1.0)
+        if extra_slot:
+            score_gap = top_scores[:, keep_count - 1] - top_scores[:, keep_count]
+            rescue_rows = score_gap < self.refine_adaptive_keep_margin
+            if rescue_rows.any():
+                rescue_batch_idx = rescue_rows.nonzero(as_tuple=False).squeeze(1)
+                rescue_cam_idx = top_idx[rescue_rows, keep_count]
+                mask[rescue_batch_idx, rescue_cam_idx] = 1.0
         return mask, score, scale
 
     def forward_proposed(self, imgs_list):

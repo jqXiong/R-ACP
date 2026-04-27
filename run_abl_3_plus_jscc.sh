@@ -10,4 +10,4 @@ TAU2="${TAU2:-2}"
 BATCH="${BATCH:-1}"
 SNR_SWEEP="${SNR_SWEEP:--5,0,5,10,15,20}"
 
-"${PYTHON_BIN}" main_coding_and_inference.py --dataset_path "${DATASET_PATH}" --model_path "${MODEL_PATH}" --epochs "${EPOCHS}" --batch_size "${BATCH}" --tau_1 "${TAU1}" --tau_2 "${TAU2}" --method baseline_refined --refine_keep_cameras 6 --refine_score_mode current_temporal --snr_sweep="${SNR_SWEEP}" --snr_sweep_resume --test_only --save_prefix abl_3_refined_prune --exp_name abl_3_refined_prune
+"${PYTHON_BIN}" main_coding_and_inference.py --dataset_path "${DATASET_PATH}" --model_path "${MODEL_PATH}" --epochs "${EPOCHS}" --batch_size "${BATCH}" --tau_1 "${TAU1}" --tau_2 "${TAU2}" --method baseline_refined --refine_keep_cameras 6 --refine_score_mode current --snr_sweep="${SNR_SWEEP}" --snr_sweep_resume --test_only --save_prefix abl_3_refined_prune --exp_name abl_3_refined_prune

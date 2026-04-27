@@ -65,7 +65,7 @@ def main():
     parser.add_argument('--output_csv', type=str, default='logs/snr_sweep_summary.csv')
     parser.add_argument('--pareto_csv', type=str, default='logs/snr_sweep_pareto.csv')
     parser.add_argument('--summary_csv', type=str, default='logs/snr_sweep_variant_summary.csv')
-    parser.add_argument('--tags', type=str, default='abl_1_baseline,abl_2_refined_baseline,abl_3_refined_prune,abl_4_refined_prune_masked,abl_5_refined_temporal,abl_6_refined_full')
+    parser.add_argument('--tags', type=str, default='abl_1_baseline,abl_2_refined_baseline,abl_3_refined_prune,abl_4_refined_prune_masked,abl_5_refined_temporal,abl_6_refined_adaptive')
     parser.add_argument('--epoch', type=int, default=-1, help='target epoch; -1 means latest epoch file in each run')
     args = parser.parse_args()
 
