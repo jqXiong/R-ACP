@@ -499,6 +499,20 @@ class PerspTransDetector(nn.Module):
         rate = 0.55 + 0.45 * torch.sigmoid(2.0 * snr_norm)
         return rate.clamp(0.25, 1.0)
 
+    def apply_feature_channel(self, x, snr_db):
+        b = x.shape[0]
+        snr_linear = torch.pow(10.0, snr_db / 10.0).view(b, 1, 1, 1, 1)
+        power = x.pow(2).mean(dim=(1, 2, 3, 4), keepdim=True).clamp_min(1e-6)
+        noise_std = torch.sqrt(power / snr_linear.clamp_min(1e-6))
+
+        if self.jscc_channel_type == 'awgn':
+            return x + torch.randn_like(x) * noise_std
+
+        real = torch.randn_like(x)
+        imag = torch.randn_like(x)
+        fading_mag = torch.sqrt((real.pow(2) + imag.pow(2)).clamp_min(1e-6) / 2.0)
+        return x * fading_mag + torch.randn_like(x) * noise_std
+
     def _get_current_epoch(self):
         if not os.path.exists('epoch.log'):
             return 0
@@ -834,6 +848,8 @@ class PerspTransDetector(nn.Module):
             feature4prediction = feature4prediction * repeated_channel_mask
             repeated_scale = camera_scale.repeat_interleave(self.tau_1 + 1, dim=2).view(b, n, self.tau_1 + 1, self.channel, 1, 1)
             feature4prediction = feature4prediction * repeated_scale
+        snr_db = self.sample_snr_db(b, feature4prediction.device)
+        feature4prediction = self.apply_feature_channel(feature4prediction, snr_db)
         feature4prediction = torch.reshape(feature4prediction, (b, n, (self.tau_1 + 1) * self.channel, 90, 160))
         feature4prediction = torch.reshape(feature4prediction, (b * n, (self.tau_1 + 1) * self.channel, 90, 160))
         feature4prediction = F.interpolate(feature4prediction, size=self.upsample_shape, mode='bilinear')
