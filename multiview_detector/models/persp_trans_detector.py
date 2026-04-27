@@ -262,8 +262,10 @@ class EnhancedMapHead(nn.Module):
 
 
 class RefinedCameraSelector(nn.Module):
-    def __init__(self, feature_channels, hidden_dim=64):
+    def __init__(self, feature_channels, hidden_dim=64, scale_min=0.6, scale_max=1.0):
         super().__init__()
+        self.scale_min = scale_min
+        self.scale_max = scale_max
         input_dim = feature_channels * 3 + 2
         self.mlp = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
@@ -281,7 +283,7 @@ class RefinedCameraSelector(nn.Module):
         x = torch.cat([current_stats, history_stats, uncertainty_stats, aux_stats], dim=-1)
         hidden = self.mlp(x)
         score = self.score_head(hidden).squeeze(-1)
-        scale = 0.75 + 0.5 * self.scale_head(hidden)
+        scale = self.scale_min + (self.scale_max - self.scale_min) * self.scale_head(hidden)
         return score, scale
 
 
@@ -308,6 +310,11 @@ class PerspTransDetector(nn.Module):
         self.refine_enable_token_drop = getattr(args, 'refine_enable_token_drop', False)
         self.refine_soft_weighting = getattr(args, 'refine_soft_weighting', False)
         self.refine_adaptive_keep_margin = getattr(args, 'refine_adaptive_keep_margin', 0.0)
+        self.refine_scale_min = getattr(args, 'refine_scale_min', 0.6)
+        self.refine_scale_max = getattr(args, 'refine_scale_max', 1.0)
+        self.refine_apply_entropy_scale = getattr(args, 'refine_apply_entropy_scale', False)
+        self.refine_channel_keep_ratio = getattr(args, 'refine_channel_keep_ratio', 1.0)
+        self.refine_channel_min_keep = getattr(args, 'refine_channel_min_keep', 1)
 
         self.jscc_channel_type = getattr(args, 'jscc_channel_type', 'rayleigh')
         self.snr_min_db = getattr(args, 'snr_min_db', 0.0)
@@ -365,7 +372,11 @@ class PerspTransDetector(nn.Module):
             num_cam=self.num_cam,
             tau_1=self.tau_1,
         ).to('cuda:0')
-        self.refined_selector = RefinedCameraSelector(self.channel).to('cuda:0')
+        self.refined_selector = RefinedCameraSelector(
+            self.channel,
+            scale_min=self.refine_scale_min,
+            scale_max=self.refine_scale_max,
+        ).to('cuda:0')
 
         self.proposed_tx_channels = (self.tau_1 + 1) * self.channel
         if self.method == 'proposed_jscc':
@@ -632,6 +643,21 @@ class PerspTransDetector(nn.Module):
                 mask[rescue_batch_idx, rescue_cam_idx] = 1.0
         return mask, score, scale
 
+    def _build_refined_channel_mask(self, camera_scale):
+        if self.refine_channel_keep_ratio >= 1.0:
+            return torch.ones_like(camera_scale)
+
+        keep_channels = int(math.ceil(self.channel * self.refine_channel_keep_ratio))
+        keep_channels = max(self.refine_channel_min_keep, keep_channels)
+        keep_channels = min(self.channel, keep_channels)
+        if keep_channels >= self.channel:
+            return torch.ones_like(camera_scale)
+
+        top_idx = torch.topk(camera_scale, k=keep_channels, dim=2, largest=True).indices
+        channel_mask = torch.zeros_like(camera_scale)
+        channel_mask.scatter_(2, top_idx, 1.0)
+        return channel_mask
+
     def forward_proposed(self, imgs_list):
         b, t, n, c, h, w = imgs_list.shape
         assert n == self.num_cam
@@ -774,18 +800,23 @@ class PerspTransDetector(nn.Module):
                 conditional_features,
                 scales_hat,
             )
+            channel_keep_mask = self._build_refined_channel_mask(camera_scale)
         else:
             camera_keep_mask = torch.ones(b, n, device=to_be_transmitted_feature.device, dtype=to_be_transmitted_feature.dtype)
             camera_score = camera_keep_mask
             camera_scale = torch.ones(b, n, self.channel, device=to_be_transmitted_feature.device, dtype=to_be_transmitted_feature.dtype)
+            channel_keep_mask = camera_scale
 
         likelihood_input = to_be_transmitted_feature
         if self.method == 'baseline_refined':
             likelihood_input = likelihood_input * camera_keep_mask.view(b, n, 1, 1, 1)
+            likelihood_input = likelihood_input * channel_keep_mask.view(b, n, self.channel, 1, 1)
+            if self.refine_apply_entropy_scale:
+                likelihood_input = likelihood_input * camera_scale.view(b, n, self.channel, 1, 1)
         feature_likelihoods = GaussianLikelihoodEstimation(likelihood_input, scales_hat, means=means_hat)
 
         if self.method == 'baseline_refined' and self.refine_weighted_entropy:
-            likelihood_mask = camera_keep_mask.view(b, n, 1, 1, 1)
+            likelihood_mask = camera_keep_mask.view(b, n, 1, 1, 1) * channel_keep_mask.view(b, n, self.channel, 1, 1)
             bits_loss = (torch.log(feature_likelihoods) * likelihood_mask).sum() / (-math.log(2))
         else:
             bits_loss = (torch.log(feature_likelihoods).sum() / (-math.log(2)))
@@ -794,6 +825,10 @@ class PerspTransDetector(nn.Module):
         feature4prediction = torch.swapaxes(feature4prediction, 1, 2)
         if self.method == 'baseline_refined':
             feature4prediction = feature4prediction * camera_keep_mask.view(b, n, 1, 1, 1, 1)
+            repeated_channel_mask = channel_keep_mask.unsqueeze(2).repeat(1, 1, self.tau_1 + 1, 1).view(
+                b, n, self.tau_1 + 1, self.channel, 1, 1
+            )
+            feature4prediction = feature4prediction * repeated_channel_mask
             repeated_scale = camera_scale.repeat_interleave(self.tau_1 + 1, dim=2).view(b, n, self.tau_1 + 1, self.channel, 1, 1)
             feature4prediction = feature4prediction * repeated_scale
         feature4prediction = torch.reshape(feature4prediction, (b, n, (self.tau_1 + 1) * self.channel, 90, 160))
