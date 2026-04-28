@@ -18,7 +18,7 @@ python "${SCRIPT_DIR}/tools/run_paper_experiments.py" \
   --baseline_ckpt "${BASELINE_CKPT}" \
   --full_ckpt "${FULL_CKPT}" \
   --methods "jpeg,h264,h265,av1" \
-  --snr_values "-5,0,5,10,15,20" \
+  --snr_values=-5,0,5,10,15,20 \
   --snr_packet_loss_rate 0.0 \
   --h264_encoder "${H264_ENCODER}" \
   --h265_encoder "${H265_ENCODER}" \
