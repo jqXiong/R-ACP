@@ -249,6 +249,7 @@ def run_single_evaluation(
     collect_frame_stats: bool,
     seed: int,
     max_eval_batches: int,
+    snr_db: Optional[float] = None,
 ):
     spec = METHOD_SPECS[method_name]
     ensure_dir(output_dir)
@@ -257,6 +258,9 @@ def run_single_evaluation(
     gt_fpath = data_loader.dataset.gt_fpath
 
     model.eval()
+    original_test_snr_db = getattr(model, 'test_snr_db', None)
+    if snr_db is not None and hasattr(model, 'test_snr_db'):
+        model.test_snr_db = snr_db
     if spec['internal_packet_loss']:
         model.drop_prob = packet_loss_rate
     else:
@@ -268,71 +272,75 @@ def run_single_evaluation(
     frame_stats = []
     rng = np.random.default_rng(seed)
 
-    with torch.no_grad():
-        for batch_idx, (data, map_gt, _, frame) in enumerate(data_loader):
-            if max_eval_batches > 0 and batch_idx >= max_eval_batches:
-                break
+    try:
+        with torch.no_grad():
+            for batch_idx, (data, map_gt, _, frame) in enumerate(data_loader):
+                if max_eval_batches > 0 and batch_idx >= max_eval_batches:
+                    break
 
-            if codec_runner is not None:
-                eval_data, comm_kb = apply_codec_packet_loss_to_batch(
-                    data,
-                    frame,
-                    codec_runner=codec_runner,
-                    packet_loss_rate=packet_loss_rate,
-                    concealment='previous',
-                    transmitted_index=-1,
-                    rng=rng,
-                )
-            else:
-                eval_data = data
-                comm_kb = None
-
-            map_res, bits_loss, _ = model(eval_data)
-            if comm_kb is None:
-                comm_kb = float(bits_loss.item())
-            communication_costs.append(comm_kb)
-
-            loss = criterion(map_res, map_gt.to(map_res.device), data_loader.dataset.map_kernel)
-            losses += float(loss.item())
-
-            map_grid_res = map_res.detach().cpu()
-            batch_size = map_grid_res.shape[0]
-            per_sample_comm = comm_kb / max(batch_size, 1)
-            for b in range(batch_size):
-                frame_value = extract_frame_value(frame[b] if isinstance(frame, torch.Tensor) and frame.ndim > 0 else frame)
-                single_map = map_grid_res[b].squeeze()
-                score_values = single_map[single_map > cls_thres].unsqueeze(1)
-                grid_ij = (single_map > cls_thres).nonzero()
-                if data_loader.dataset.base.indexing == 'xy' and grid_ij.numel() > 0:
-                    grid_xy = grid_ij[:, [1, 0]]
-                else:
-                    grid_xy = grid_ij
-
-                if score_values.numel() > 0:
-                    frame_res = torch.cat(
-                        [
-                            torch.ones_like(score_values) * frame_value,
-                            grid_xy.float() * data_loader.dataset.grid_reduce,
-                            score_values,
-                        ],
-                        dim=1,
+                if codec_runner is not None:
+                    eval_data, comm_kb = apply_codec_packet_loss_to_batch(
+                        data,
+                        frame,
+                        codec_runner=codec_runner,
+                        packet_loss_rate=packet_loss_rate,
+                        concealment='previous',
+                        transmitted_index=-1,
+                        rng=rng,
                     )
-                    all_res_list.append(frame_res)
-
-                    positions, scores = frame_res[:, 1:3], frame_res[:, 3]
-                    ids, count = nms(positions, scores, 20, np.inf)
-                    target_count = int(count)
                 else:
-                    target_count = 0
+                    eval_data = data
+                    comm_kb = None
 
-                if collect_frame_stats:
-                    frame_stats.append(
-                        {
-                            'frame_id': frame_value,
-                            'num_targets': target_count,
-                            'comm_kb': per_sample_comm,
-                        }
-                    )
+                map_res, bits_loss, _ = model(eval_data)
+                if comm_kb is None:
+                    comm_kb = float(bits_loss.item())
+                communication_costs.append(comm_kb)
+
+                loss = criterion(map_res, map_gt.to(map_res.device), data_loader.dataset.map_kernel)
+                losses += float(loss.item())
+
+                map_grid_res = map_res.detach().cpu()
+                batch_size = map_grid_res.shape[0]
+                per_sample_comm = comm_kb / max(batch_size, 1)
+                for b in range(batch_size):
+                    frame_value = extract_frame_value(frame[b] if isinstance(frame, torch.Tensor) and frame.ndim > 0 else frame)
+                    single_map = map_grid_res[b].squeeze()
+                    score_values = single_map[single_map > cls_thres].unsqueeze(1)
+                    grid_ij = (single_map > cls_thres).nonzero()
+                    if data_loader.dataset.base.indexing == 'xy' and grid_ij.numel() > 0:
+                        grid_xy = grid_ij[:, [1, 0]]
+                    else:
+                        grid_xy = grid_ij
+
+                    if score_values.numel() > 0:
+                        frame_res = torch.cat(
+                            [
+                                torch.ones_like(score_values) * frame_value,
+                                grid_xy.float() * data_loader.dataset.grid_reduce,
+                                score_values,
+                            ],
+                            dim=1,
+                        )
+                        all_res_list.append(frame_res)
+
+                        positions, scores = frame_res[:, 1:3], frame_res[:, 3]
+                        ids, count = nms(positions, scores, 20, np.inf)
+                        target_count = int(count)
+                    else:
+                        target_count = 0
+
+                    if collect_frame_stats:
+                        frame_stats.append(
+                            {
+                                'frame_id': frame_value,
+                                'num_targets': target_count,
+                                'comm_kb': per_sample_comm,
+                            }
+                        )
+    finally:
+        if snr_db is not None and hasattr(model, 'test_snr_db') and original_test_snr_db is not None:
+            model.test_snr_db = original_test_snr_db
 
     if all_res_list:
         all_res_tensor = torch.cat(all_res_list, dim=0)
@@ -417,6 +425,7 @@ def run_packet_loss_experiment(args, models, data_loader, criterion):
                     collect_frame_stats=False,
                     seed=args.seed + int(loss_rate * 1000),
                     max_eval_batches=args.max_eval_batches,
+                    snr_db=args.test_snr_db,
                 )
                 rows.append(
                     {
@@ -512,6 +521,7 @@ def run_aopt_experiment(args, models, data_loader, criterion):
                 collect_frame_stats=True,
                 seed=args.seed,
                 max_eval_batches=args.max_eval_batches,
+                snr_db=args.test_snr_db,
             )
 
             for capacity in args.aopt_capacities:
@@ -579,6 +589,103 @@ def run_aopt_experiment(args, models, data_loader, criterion):
     print(f'Wrote AoPT comparison to {detail_csv}')
 
 
+def run_snr_experiment(args, models, data_loader, criterion):
+    output_csv = os.path.join(args.output_dir, 'snr_summary.csv')
+    rows = []
+    codec_runners = {}
+
+    for method_name in args.methods:
+        spec = METHOD_SPECS[method_name]
+        model = models[spec['model_key']]
+        codec_runner = None
+        if spec['codec'] is not None:
+            codec_runner = codec_runners.get(spec['codec'])
+            if codec_runner is None:
+                codec_runner = TensorImageCodec(
+                    spec['codec'],
+                    ffmpeg_bin=args.ffmpeg_bin,
+                    jpeg_quality=args.jpeg_quality,
+                    h264_crf=args.h264_crf,
+                    h265_crf=args.h265_crf,
+                    av1_crf=args.av1_crf,
+                    h264_encoder=args.h264_encoder,
+                    h265_encoder=args.h265_encoder,
+                    av1_encoder=args.av1_encoder,
+                )
+                codec_runners[spec['codec']] = codec_runner
+
+        for snr_db in args.snr_values:
+            experiment_dir = os.path.join(args.output_dir, method_name, f'snr_{str(snr_db).replace(".", "p")}')
+            try:
+                result = run_single_evaluation(
+                    method_name=method_name,
+                    model=model,
+                    data_loader=data_loader,
+                    criterion=criterion,
+                    cls_thres=args.cls_thres,
+                    output_dir=experiment_dir,
+                    packet_loss_rate=args.snr_packet_loss_rate,
+                    codec_runner=codec_runner,
+                    collect_frame_stats=False,
+                    seed=args.seed + int((snr_db + 100.0) * 10),
+                    max_eval_batches=args.max_eval_batches,
+                    snr_db=snr_db,
+                )
+                rows.append(
+                    {
+                        'method': method_name,
+                        'snr_db': snr_db,
+                        'loss': result['loss'],
+                        'moda': result['moda'],
+                        'modp': result['modp'],
+                        'eval_precision': result['eval_precision'],
+                        'eval_recall': result['eval_recall'],
+                        'comm_kb': result['comm_kb'],
+                        'status': 'ok',
+                        'error': '',
+                        'result_dir': experiment_dir,
+                    }
+                )
+            except Exception as exc:
+                rows.append(
+                    {
+                        'method': method_name,
+                        'snr_db': snr_db,
+                        'loss': float('nan'),
+                        'moda': float('nan'),
+                        'modp': float('nan'),
+                        'eval_precision': float('nan'),
+                        'eval_recall': float('nan'),
+                        'comm_kb': float('nan'),
+                        'status': 'error',
+                        'error': str(exc).replace('\n', ' | '),
+                        'result_dir': experiment_dir,
+                    }
+                )
+                print(f'[warn] {method_name} at SNR {snr_db:.1f} dB failed: {exc}')
+
+    with open(output_csv, 'w', newline='') as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                'method',
+                'snr_db',
+                'loss',
+                'moda',
+                'modp',
+                'eval_precision',
+                'eval_recall',
+                'comm_kb',
+                'status',
+                'error',
+                'result_dir',
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f'Wrote SNR comparison to {output_csv}')
+
+
 def parse_float_list(value: str) -> List[float]:
     return [float(x.strip()) for x in value.split(',') if x.strip()]
 
@@ -593,7 +700,7 @@ def parse_method_list(value: str) -> List[str]:
 
 def main():
     parser = argparse.ArgumentParser(description='Run packet-loss and AoPT comparison experiments.')
-    parser.add_argument('--experiment', type=str, required=True, choices=['packet_loss', 'aopt'])
+    parser.add_argument('--experiment', type=str, required=True, choices=['packet_loss', 'aopt', 'snr'])
     parser.add_argument('--dataset_path', type=str, default='./Data/Wildtrack')
     parser.add_argument('--baseline_ckpt', type=str, required=True)
     parser.add_argument('--full_ckpt', type=str, required=True)
@@ -613,6 +720,8 @@ def main():
     parser.add_argument('--h265_encoder', type=str, default='')
     parser.add_argument('--av1_encoder', type=str, default='')
     parser.add_argument('--packet_loss_rates', type=str, default='0,0.1,0.2,0.3,0.4')
+    parser.add_argument('--snr_values', type=str, default='-5,0,5,10,15,20')
+    parser.add_argument('--snr_packet_loss_rate', type=float, default=0.0)
     parser.add_argument('--aopt_capacities', type=str, default='20,40,60,80,100,120')
     parser.add_argument('--aopt_packet_loss_rate', type=float, default=0.0)
     parser.add_argument('--lambda_camera', type=float, default=0.5)
@@ -622,6 +731,7 @@ def main():
 
     args.methods = parse_method_list(args.methods)
     args.packet_loss_rates = parse_float_list(args.packet_loss_rates)
+    args.snr_values = parse_float_list(args.snr_values)
     args.aopt_capacities = parse_float_list(args.aopt_capacities)
     if not args.output_dir:
         timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
@@ -666,8 +776,10 @@ def main():
 
     if args.experiment == 'packet_loss':
         run_packet_loss_experiment(args, models, test_loader, criterion)
-    else:
+    elif args.experiment == 'aopt':
         run_aopt_experiment(args, models, test_loader, criterion)
+    else:
+        run_snr_experiment(args, models, test_loader, criterion)
 
 
 if __name__ == '__main__':
