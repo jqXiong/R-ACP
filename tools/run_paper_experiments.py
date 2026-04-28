@@ -3,6 +3,7 @@ import csv
 import datetime
 import os
 import sys
+import warnings
 from types import SimpleNamespace
 from typing import Dict, List, Optional
 
@@ -109,10 +110,49 @@ METHOD_SPECS = {
 
 
 def load_checkpoint_args(checkpoint_path: str) -> Dict:
-    payload = torch.load(checkpoint_path, map_location='cpu')
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', FutureWarning)
+        payload = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     if isinstance(payload, dict):
         return payload.get('args', {}) or {}
     return {}
+
+
+def resolve_dataset_path(dataset_path: str) -> str:
+    raw = os.path.expanduser(dataset_path)
+    candidates = []
+
+    if os.path.isabs(raw):
+        candidates.append(raw)
+        candidates.append(os.path.join(REPO_ROOT, raw.lstrip('/\\')))
+    else:
+        candidates.append(os.path.abspath(os.path.join(REPO_ROOT, raw)))
+        candidates.append(os.path.abspath(raw))
+
+    candidates.append(os.path.join(REPO_ROOT, 'Data', 'Wildtrack'))
+
+    seen = set()
+    unique_candidates = []
+    for path in candidates:
+        norm = os.path.normpath(path)
+        if norm not in seen:
+            seen.add(norm)
+            unique_candidates.append(norm)
+
+    for candidate in unique_candidates:
+        if os.path.isdir(candidate):
+            required = [
+                os.path.join(candidate, 'Image_subsets'),
+                os.path.join(candidate, 'annotations_positions'),
+                os.path.join(candidate, 'calibrations'),
+            ]
+            if all(os.path.exists(x) for x in required):
+                return candidate
+
+    raise FileNotFoundError(
+        'Wildtrack dataset directory was not found. Tried:\n' +
+        '\n'.join(unique_candidates)
+    )
 
 
 def build_runtime_args(checkpoint_path: str, overrides: Dict) -> SimpleNamespace:
@@ -125,7 +165,9 @@ def build_runtime_args(checkpoint_path: str, overrides: Dict) -> SimpleNamespace
 def build_dataloaders(args, tau: int):
     normalize = T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
     transform = T.Compose([T.Resize([720, 1280]), T.ToTensor(), normalize])
-    base = Wildtrack(os.path.expanduser(args.dataset_path))
+    resolved_dataset_path = resolve_dataset_path(args.dataset_path)
+    print(f'Using dataset path: {resolved_dataset_path}')
+    base = Wildtrack(resolved_dataset_path)
     test_set = sequenceDataset4phase2(base, tau=tau, train=False, transform=transform, grid_reduce=4)
     test_loader = torch.utils.data.DataLoader(
         test_set,

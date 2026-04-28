@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-DATASET_PATH="${DATASET_PATH:-/Data/Wildtrack}"
+DATASET_PATH="${DATASET_PATH:-./Data/Wildtrack}"
 BASELINE_CKPT="${BASELINE_CKPT:-./models_temp/abl_1_baseline.pth}"
 FULL_CKPT="${FULL_CKPT:-./models_temp/abl_6_refined_adaptive.pth}"
 OUTPUT_DIR="${OUTPUT_DIR:-logs/$(date +%F_%H-%M-%S)_aopt_comparison}"
