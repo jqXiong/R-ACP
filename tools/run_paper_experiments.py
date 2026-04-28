@@ -396,37 +396,60 @@ def run_packet_loss_experiment(args, models, data_loader, criterion):
                     h264_crf=args.h264_crf,
                     h265_crf=args.h265_crf,
                     av1_crf=args.av1_crf,
+                    h264_encoder=args.h264_encoder,
+                    h265_encoder=args.h265_encoder,
+                    av1_encoder=args.av1_encoder,
                 )
                 codec_runners[spec['codec']] = codec_runner
 
         for loss_rate in args.packet_loss_rates:
             experiment_dir = os.path.join(args.output_dir, method_name, f'packet_loss_{str(loss_rate).replace(".", "p")}')
-            result = run_single_evaluation(
-                method_name=method_name,
-                model=model,
-                data_loader=data_loader,
-                criterion=criterion,
-                cls_thres=args.cls_thres,
-                output_dir=experiment_dir,
-                packet_loss_rate=loss_rate,
-                codec_runner=codec_runner,
-                collect_frame_stats=False,
-                seed=args.seed + int(loss_rate * 1000),
-                max_eval_batches=args.max_eval_batches,
-            )
-            rows.append(
-                {
-                    'method': method_name,
-                    'packet_loss_rate': loss_rate,
-                    'loss': result['loss'],
-                    'moda': result['moda'],
-                    'modp': result['modp'],
-                    'eval_precision': result['eval_precision'],
-                    'eval_recall': result['eval_recall'],
-                    'comm_kb': result['comm_kb'],
-                    'result_dir': experiment_dir,
-                }
-            )
+            try:
+                result = run_single_evaluation(
+                    method_name=method_name,
+                    model=model,
+                    data_loader=data_loader,
+                    criterion=criterion,
+                    cls_thres=args.cls_thres,
+                    output_dir=experiment_dir,
+                    packet_loss_rate=loss_rate,
+                    codec_runner=codec_runner,
+                    collect_frame_stats=False,
+                    seed=args.seed + int(loss_rate * 1000),
+                    max_eval_batches=args.max_eval_batches,
+                )
+                rows.append(
+                    {
+                        'method': method_name,
+                        'packet_loss_rate': loss_rate,
+                        'loss': result['loss'],
+                        'moda': result['moda'],
+                        'modp': result['modp'],
+                        'eval_precision': result['eval_precision'],
+                        'eval_recall': result['eval_recall'],
+                        'comm_kb': result['comm_kb'],
+                        'status': 'ok',
+                        'error': '',
+                        'result_dir': experiment_dir,
+                    }
+                )
+            except Exception as exc:
+                rows.append(
+                    {
+                        'method': method_name,
+                        'packet_loss_rate': loss_rate,
+                        'loss': float('nan'),
+                        'moda': float('nan'),
+                        'modp': float('nan'),
+                        'eval_precision': float('nan'),
+                        'eval_recall': float('nan'),
+                        'comm_kb': float('nan'),
+                        'status': 'error',
+                        'error': str(exc).replace('\n', ' | '),
+                        'result_dir': experiment_dir,
+                    }
+                )
+                print(f'[warn] {method_name} at packet loss {loss_rate:.2f} failed: {exc}')
 
     with open(output_csv, 'w', newline='') as f:
         writer = csv.DictWriter(
@@ -440,6 +463,8 @@ def run_packet_loss_experiment(args, models, data_loader, criterion):
                 'eval_precision',
                 'eval_recall',
                 'comm_kb',
+                'status',
+                'error',
                 'result_dir',
             ],
         )
@@ -467,44 +492,69 @@ def run_aopt_experiment(args, models, data_loader, criterion):
                     h264_crf=args.h264_crf,
                     h265_crf=args.h265_crf,
                     av1_crf=args.av1_crf,
+                    h264_encoder=args.h264_encoder,
+                    h265_encoder=args.h265_encoder,
+                    av1_encoder=args.av1_encoder,
                 )
                 codec_runners[spec['codec']] = codec_runner
 
         experiment_dir = os.path.join(args.output_dir, method_name, 'capacity_sweep')
-        result = run_single_evaluation(
-            method_name=method_name,
-            model=model,
-            data_loader=data_loader,
-            criterion=criterion,
-            cls_thres=args.cls_thres,
-            output_dir=experiment_dir,
-            packet_loss_rate=args.aopt_packet_loss_rate,
-            codec_runner=codec_runner,
-            collect_frame_stats=True,
-            seed=args.seed,
-            max_eval_batches=args.max_eval_batches,
-        )
-
-        for capacity in args.aopt_capacities:
-            rows.append(
-                {
-                    'method': method_name,
-                    'capacity_kbps': capacity,
-                    'aopt': compute_aopt(
-                        result['frame_stats'],
-                        capacity_kbps=capacity,
-                        lambda_camera=args.lambda_camera,
-                        min_targets=args.aopt_min_targets,
-                    ),
-                    'moda': result['moda'],
-                    'modp': result['modp'],
-                    'eval_precision': result['eval_precision'],
-                    'eval_recall': result['eval_recall'],
-                    'comm_kb': result['comm_kb'],
-                    'frame_stats_path': result['frame_stats_path'],
-                    'result_dir': experiment_dir,
-                }
+        try:
+            result = run_single_evaluation(
+                method_name=method_name,
+                model=model,
+                data_loader=data_loader,
+                criterion=criterion,
+                cls_thres=args.cls_thres,
+                output_dir=experiment_dir,
+                packet_loss_rate=args.aopt_packet_loss_rate,
+                codec_runner=codec_runner,
+                collect_frame_stats=True,
+                seed=args.seed,
+                max_eval_batches=args.max_eval_batches,
             )
+
+            for capacity in args.aopt_capacities:
+                rows.append(
+                    {
+                        'method': method_name,
+                        'capacity_kbps': capacity,
+                        'aopt': compute_aopt(
+                            result['frame_stats'],
+                            capacity_kbps=capacity,
+                            lambda_camera=args.lambda_camera,
+                            min_targets=args.aopt_min_targets,
+                        ),
+                        'moda': result['moda'],
+                        'modp': result['modp'],
+                        'eval_precision': result['eval_precision'],
+                        'eval_recall': result['eval_recall'],
+                        'comm_kb': result['comm_kb'],
+                        'status': 'ok',
+                        'error': '',
+                        'frame_stats_path': result['frame_stats_path'],
+                        'result_dir': experiment_dir,
+                    }
+                )
+        except Exception as exc:
+            for capacity in args.aopt_capacities:
+                rows.append(
+                    {
+                        'method': method_name,
+                        'capacity_kbps': capacity,
+                        'aopt': float('nan'),
+                        'moda': float('nan'),
+                        'modp': float('nan'),
+                        'eval_precision': float('nan'),
+                        'eval_recall': float('nan'),
+                        'comm_kb': float('nan'),
+                        'status': 'error',
+                        'error': str(exc).replace('\n', ' | '),
+                        'frame_stats_path': '',
+                        'result_dir': experiment_dir,
+                    }
+                )
+            print(f'[warn] {method_name} AoPT sweep failed: {exc}')
 
     with open(detail_csv, 'w', newline='') as f:
         writer = csv.DictWriter(
@@ -518,6 +568,8 @@ def run_aopt_experiment(args, models, data_loader, criterion):
                 'eval_precision',
                 'eval_recall',
                 'comm_kb',
+                'status',
+                'error',
                 'frame_stats_path',
                 'result_dir',
             ],
@@ -557,6 +609,9 @@ def main():
     parser.add_argument('--h264_crf', type=int, default=28)
     parser.add_argument('--h265_crf', type=int, default=30)
     parser.add_argument('--av1_crf', type=int, default=35)
+    parser.add_argument('--h264_encoder', type=str, default='')
+    parser.add_argument('--h265_encoder', type=str, default='')
+    parser.add_argument('--av1_encoder', type=str, default='')
     parser.add_argument('--packet_loss_rates', type=str, default='0,0.1,0.2,0.3,0.4')
     parser.add_argument('--aopt_capacities', type=str, default='20,40,60,80,100,120')
     parser.add_argument('--aopt_packet_loss_rate', type=float, default=0.0)

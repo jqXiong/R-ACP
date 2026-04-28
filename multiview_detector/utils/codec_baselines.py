@@ -35,6 +35,9 @@ class TensorImageCodec:
         h264_crf: int = 28,
         h265_crf: int = 30,
         av1_crf: int = 35,
+        h264_encoder: Optional[str] = None,
+        h265_encoder: Optional[str] = None,
+        av1_encoder: Optional[str] = None,
         use_cache: bool = True,
     ):
         self.codec = codec.lower()
@@ -43,8 +46,12 @@ class TensorImageCodec:
         self.h264_crf = h264_crf
         self.h265_crf = h265_crf
         self.av1_crf = av1_crf
+        self.h264_encoder = h264_encoder
+        self.h265_encoder = h265_encoder
+        self.av1_encoder = av1_encoder
         self.use_cache = use_cache
         self._cache: Dict[str, Tuple[torch.Tensor, int]] = {}
+        self._available_encoders = None
 
     def encode_decode(self, tensor: torch.Tensor, cache_key: Optional[str] = None) -> Tuple[torch.Tensor, int]:
         if self.use_cache and cache_key is not None and cache_key in self._cache:
@@ -89,121 +96,7 @@ class TensorImageCodec:
             decoded_path = os.path.join(tmpdir, 'decoded.png')
             Image.fromarray(image).save(input_path)
 
-            if self.codec == 'h264':
-                command_candidates = [
-                    [
-                        self.ffmpeg_bin,
-                        '-y',
-                        '-loglevel',
-                        'error',
-                        '-i',
-                        input_path,
-                        '-frames:v',
-                        '1',
-                        '-an',
-                        '-c:v',
-                        'libx264',
-                        '-crf',
-                        str(self.h264_crf),
-                        '-pix_fmt',
-                        'yuv420p',
-                        encoded_path,
-                    ],
-                    [
-                        self.ffmpeg_bin,
-                        '-y',
-                        '-loglevel',
-                        'error',
-                        '-i',
-                        input_path,
-                        '-frames:v',
-                        '1',
-                        '-an',
-                        '-c:v',
-                        'h264',
-                        '-pix_fmt',
-                        'yuv420p',
-                        encoded_path,
-                    ],
-                ]
-            elif self.codec == 'h265':
-                command_candidates = [
-                    [
-                        self.ffmpeg_bin,
-                        '-y',
-                        '-loglevel',
-                        'error',
-                        '-i',
-                        input_path,
-                        '-frames:v',
-                        '1',
-                        '-an',
-                        '-c:v',
-                        'libx265',
-                        '-crf',
-                        str(self.h265_crf),
-                        '-pix_fmt',
-                        'yuv420p',
-                        encoded_path,
-                    ],
-                    [
-                        self.ffmpeg_bin,
-                        '-y',
-                        '-loglevel',
-                        'error',
-                        '-i',
-                        input_path,
-                        '-frames:v',
-                        '1',
-                        '-an',
-                        '-c:v',
-                        'hevc',
-                        '-pix_fmt',
-                        'yuv420p',
-                        encoded_path,
-                    ],
-                ]
-            else:
-                command_candidates = [
-                    [
-                        self.ffmpeg_bin,
-                        '-y',
-                        '-loglevel',
-                        'error',
-                        '-i',
-                        input_path,
-                        '-frames:v',
-                        '1',
-                        '-an',
-                        '-c:v',
-                        'libaom-av1',
-                        '-crf',
-                        str(self.av1_crf),
-                        '-b:v',
-                        '0',
-                        '-still-picture',
-                        '1',
-                        '-pix_fmt',
-                        'yuv420p',
-                        encoded_path,
-                    ],
-                    [
-                        self.ffmpeg_bin,
-                        '-y',
-                        '-loglevel',
-                        'error',
-                        '-i',
-                        input_path,
-                        '-frames:v',
-                        '1',
-                        '-an',
-                        '-c:v',
-                        'av1',
-                        '-pix_fmt',
-                        'yuv420p',
-                        encoded_path,
-                    ],
-                ]
+            command_candidates = self._build_encoder_commands(input_path, encoded_path)
             self._run_ffmpeg_candidates(command_candidates)
             encoded_bytes = os.path.getsize(encoded_path)
             self._run_ffmpeg_candidates([
@@ -211,6 +104,76 @@ class TensorImageCodec:
             ])
             decoded = np.array(Image.open(decoded_path).convert('RGB'))
         return decoded, encoded_bytes
+
+    def _get_available_encoders(self):
+        if self._available_encoders is not None:
+            return self._available_encoders
+        result = subprocess.run(
+            [self.ffmpeg_bin, '-hide_banner', '-encoders'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        encoders = set()
+        for line in (result.stdout or '').splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[0].startswith('V'):
+                encoders.add(parts[1])
+        self._available_encoders = encoders
+        return encoders
+
+    def _preferred_encoders(self):
+        if self.codec == 'h264':
+            override = [self.h264_encoder] if self.h264_encoder else []
+            preferred = ['libx264', 'libopenh264', 'h264_nvenc', 'h264_qsv', 'h264_vaapi', 'h264_v4l2m2m', 'h264_amf', 'h264_mf']
+        elif self.codec == 'h265':
+            override = [self.h265_encoder] if self.h265_encoder else []
+            preferred = ['libx265', 'hevc_nvenc', 'hevc_qsv', 'hevc_vaapi', 'hevc_v4l2m2m', 'hevc_amf', 'hevc_mf']
+        else:
+            override = [self.av1_encoder] if self.av1_encoder else []
+            preferred = ['libaom-av1', 'svtav1', 'rav1e', 'av1_nvenc', 'av1_qsv', 'av1_amf', 'av1_vaapi']
+        available = self._get_available_encoders()
+        ordered = []
+        for name in override + preferred:
+            if name and name in available and name not in ordered:
+                ordered.append(name)
+        return ordered
+
+    def _build_encoder_commands(self, input_path: str, encoded_path: str):
+        encoder_names = self._preferred_encoders()
+        if not encoder_names:
+            raise RuntimeError(
+                f'No usable ffmpeg encoder found for codec "{self.codec}". '
+                f'You can pass an explicit encoder override for this codec.'
+            )
+        commands = []
+        for encoder in encoder_names:
+            command = [
+                self.ffmpeg_bin,
+                '-y',
+                '-loglevel',
+                'error',
+                '-i',
+                input_path,
+                '-frames:v',
+                '1',
+                '-an',
+                '-c:v',
+                encoder,
+            ]
+            if encoder == 'libx264':
+                command += ['-crf', str(self.h264_crf), '-pix_fmt', 'yuv420p']
+            elif encoder == 'libx265':
+                command += ['-crf', str(self.h265_crf), '-pix_fmt', 'yuv420p']
+            elif encoder == 'libaom-av1':
+                command += ['-crf', str(self.av1_crf), '-b:v', '0', '-still-picture', '1', '-pix_fmt', 'yuv420p']
+            elif encoder in ('svtav1', 'rav1e'):
+                command += ['-crf', str(self.av1_crf), '-pix_fmt', 'yuv420p']
+            else:
+                command += ['-pix_fmt', 'yuv420p']
+            command.append(encoded_path)
+            commands.append(command)
+        return commands
 
     def _run_ffmpeg_candidates(self, command_candidates):
         errors = []
