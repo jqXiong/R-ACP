@@ -18,5 +18,5 @@ python "${SCRIPT_DIR}/tools/run_paper_experiments.py" \
   --packet_loss_rates "0,0.1,0.2,0.3,0.4" \
   --test_snr_db 20 \
   --batch_size 1 \
-  --num_workers 4 \
+  --num_workers 0 \
   --output_dir "${OUTPUT_DIR}"

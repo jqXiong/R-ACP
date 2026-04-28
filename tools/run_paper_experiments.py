@@ -568,9 +568,6 @@ def main():
     args.methods = parse_method_list(args.methods)
     args.packet_loss_rates = parse_float_list(args.packet_loss_rates)
     args.aopt_capacities = parse_float_list(args.aopt_capacities)
-    if args.batch_size != 1:
-        raise ValueError('These comparison scripts currently require --batch_size 1 for per-frame cost/AoPT accounting.')
-
     if not args.output_dir:
         timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
         args.output_dir = os.path.join('logs', f'{timestamp}_{args.experiment}_comparison')
@@ -609,6 +606,8 @@ def main():
     print(f'Running {args.experiment} experiment')
     print(f'Methods: {args.methods}')
     print(f'Output dir: {args.output_dir}')
+    if any(METHOD_SPECS[m]['codec'] is not None for m in args.methods):
+        print('Note: JPEG/H.264/H.265/AV1 baselines use CPU-side image codec round-trip. Detector inference still uses GPU.')
 
     if args.experiment == 'packet_loss':
         run_packet_loss_experiment(args, models, test_loader, criterion)

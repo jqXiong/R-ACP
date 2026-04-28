@@ -21,5 +21,5 @@ python "${SCRIPT_DIR}/tools/run_paper_experiments.py" \
   --aopt_min_targets 1 \
   --test_snr_db 20 \
   --batch_size 1 \
-  --num_workers 4 \
+  --num_workers 0 \
   --output_dir "${OUTPUT_DIR}"

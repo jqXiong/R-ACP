@@ -90,80 +90,150 @@ class TensorImageCodec:
             Image.fromarray(image).save(input_path)
 
             if self.codec == 'h264':
-                command = [
-                    self.ffmpeg_bin,
-                    '-y',
-                    '-loglevel',
-                    'error',
-                    '-i',
-                    input_path,
-                    '-an',
-                    '-c:v',
-                    'libx264',
-                    '-preset',
-                    'veryfast',
-                    '-tune',
-                    'zerolatency',
-                    '-g',
-                    '1',
-                    '-keyint_min',
-                    '1',
-                    '-crf',
-                    str(self.h264_crf),
-                    '-pix_fmt',
-                    'yuv420p',
-                    encoded_path,
+                command_candidates = [
+                    [
+                        self.ffmpeg_bin,
+                        '-y',
+                        '-loglevel',
+                        'error',
+                        '-i',
+                        input_path,
+                        '-frames:v',
+                        '1',
+                        '-an',
+                        '-c:v',
+                        'libx264',
+                        '-crf',
+                        str(self.h264_crf),
+                        '-pix_fmt',
+                        'yuv420p',
+                        encoded_path,
+                    ],
+                    [
+                        self.ffmpeg_bin,
+                        '-y',
+                        '-loglevel',
+                        'error',
+                        '-i',
+                        input_path,
+                        '-frames:v',
+                        '1',
+                        '-an',
+                        '-c:v',
+                        'h264',
+                        '-pix_fmt',
+                        'yuv420p',
+                        encoded_path,
+                    ],
                 ]
             elif self.codec == 'h265':
-                command = [
-                    self.ffmpeg_bin,
-                    '-y',
-                    '-loglevel',
-                    'error',
-                    '-i',
-                    input_path,
-                    '-an',
-                    '-c:v',
-                    'libx265',
-                    '-preset',
-                    'fast',
-                    '-x265-params',
-                    f'keyint=1:min-keyint=1:no-scenecut=1:crf={self.h265_crf}',
-                    '-pix_fmt',
-                    'yuv420p',
-                    encoded_path,
+                command_candidates = [
+                    [
+                        self.ffmpeg_bin,
+                        '-y',
+                        '-loglevel',
+                        'error',
+                        '-i',
+                        input_path,
+                        '-frames:v',
+                        '1',
+                        '-an',
+                        '-c:v',
+                        'libx265',
+                        '-crf',
+                        str(self.h265_crf),
+                        '-pix_fmt',
+                        'yuv420p',
+                        encoded_path,
+                    ],
+                    [
+                        self.ffmpeg_bin,
+                        '-y',
+                        '-loglevel',
+                        'error',
+                        '-i',
+                        input_path,
+                        '-frames:v',
+                        '1',
+                        '-an',
+                        '-c:v',
+                        'hevc',
+                        '-pix_fmt',
+                        'yuv420p',
+                        encoded_path,
+                    ],
                 ]
             else:
-                command = [
-                    self.ffmpeg_bin,
-                    '-y',
-                    '-loglevel',
-                    'error',
-                    '-i',
-                    input_path,
-                    '-an',
-                    '-c:v',
-                    'libaom-av1',
-                    '-cpu-used',
-                    '8',
-                    '-crf',
-                    str(self.av1_crf),
-                    '-b:v',
-                    '0',
-                    '-still-picture',
-                    '1',
-                    '-pix_fmt',
-                    'yuv420p',
-                    encoded_path,
+                command_candidates = [
+                    [
+                        self.ffmpeg_bin,
+                        '-y',
+                        '-loglevel',
+                        'error',
+                        '-i',
+                        input_path,
+                        '-frames:v',
+                        '1',
+                        '-an',
+                        '-c:v',
+                        'libaom-av1',
+                        '-crf',
+                        str(self.av1_crf),
+                        '-b:v',
+                        '0',
+                        '-still-picture',
+                        '1',
+                        '-pix_fmt',
+                        'yuv420p',
+                        encoded_path,
+                    ],
+                    [
+                        self.ffmpeg_bin,
+                        '-y',
+                        '-loglevel',
+                        'error',
+                        '-i',
+                        input_path,
+                        '-frames:v',
+                        '1',
+                        '-an',
+                        '-c:v',
+                        'av1',
+                        '-pix_fmt',
+                        'yuv420p',
+                        encoded_path,
+                    ],
                 ]
-            subprocess.run(command, check=True)
+            self._run_ffmpeg_candidates(command_candidates)
             encoded_bytes = os.path.getsize(encoded_path)
-            subprocess.run(
-                [self.ffmpeg_bin, '-y', '-loglevel', 'error', '-i', encoded_path, decoded_path],
-                check=True,
-            )
+            self._run_ffmpeg_candidates([
+                [self.ffmpeg_bin, '-y', '-loglevel', 'error', '-i', encoded_path, decoded_path]
+            ])
             decoded = np.array(Image.open(decoded_path).convert('RGB'))
         return decoded, encoded_bytes
+
+    def _run_ffmpeg_candidates(self, command_candidates):
+        errors = []
+        for command in command_candidates:
+            result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if result.returncode == 0:
+                return
+            errors.append(
+                {
+                    'command': command,
+                    'stderr': (result.stderr or '').strip(),
+                    'stdout': (result.stdout or '').strip(),
+                    'returncode': result.returncode,
+                }
+            )
+        message_lines = ['All ffmpeg command candidates failed.']
+        for idx, item in enumerate(errors, start=1):
+            message_lines.append(f'Candidate {idx} rc={item["returncode"]}: {" ".join(item["command"])}')
+            if item['stderr']:
+                message_lines.append(f'stderr: {item["stderr"]}')
+            if item['stdout']:
+                message_lines.append(f'stdout: {item["stdout"]}')
+        raise RuntimeError('\n'.join(message_lines))
 
 
 def apply_codec_packet_loss_to_batch(
