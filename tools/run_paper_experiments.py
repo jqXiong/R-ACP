@@ -3,6 +3,7 @@ import csv
 import datetime
 import os
 import sys
+import time
 import warnings
 from types import SimpleNamespace
 from typing import Dict, List, Optional
@@ -225,16 +226,42 @@ def extract_frame_value(frame_item):
     return int(frame_item)
 
 
+def _sync_cuda():
+    if not torch.cuda.is_available():
+        return
+    for device_idx in range(torch.cuda.device_count()):
+        torch.cuda.synchronize(device_idx)
+
+
+def _count_targets_from_map(single_map: torch.Tensor, cls_thres: float) -> int:
+    score_values = single_map[single_map > cls_thres].unsqueeze(1)
+    if score_values.numel() == 0:
+        return 0
+    positions = (single_map > cls_thres).nonzero()
+    ids, count = nms(positions.float(), score_values.squeeze(1), 20, np.inf)
+    return int(count)
+
+
 def compute_aopt(frame_stats: List[Dict], capacity_kbps: float, lambda_camera: float, min_targets: int) -> float:
     delta_t = 1.0 / max(lambda_camera, 1e-6)
     total = 0.0
+    valid_frames = 0
     for row in frame_stats:
-        perceived_targets = row['num_targets']
-        if perceived_targets < min_targets:
-            continue
-        d_total = row['comm_kb'] / max(capacity_kbps, 1e-6)
-        total += perceived_targets * (delta_t ** 2 + d_total)
-    return total / max(len(frame_stats), 1)
+        target_counts = row['camera_target_counts']
+        camera_comm_kb = row['camera_comm_kb']
+        inference_delay_s = row['inference_delay_s']
+        worst_case = 0.0
+        for g_k, comm_kb_k in zip(target_counts, camera_comm_kb):
+            if g_k < min_targets:
+                continue
+            d_transmission = comm_kb_k / max(capacity_kbps, 1e-6)
+            d_total_k = inference_delay_s + d_transmission
+            aopt_k = g_k * (delta_t / 2.0 + d_total_k)
+            if aopt_k > worst_case:
+                worst_case = aopt_k
+        total += worst_case
+        valid_frames += 1
+    return total / max(valid_frames, 1)
 
 
 def run_single_evaluation(
@@ -279,7 +306,7 @@ def run_single_evaluation(
                     break
 
                 if codec_runner is not None:
-                    eval_data, comm_kb = apply_codec_packet_loss_to_batch(
+                    eval_data, comm_kb, codec_camera_kb = apply_codec_packet_loss_to_batch(
                         data,
                         frame,
                         codec_runner=codec_runner,
@@ -291,10 +318,26 @@ def run_single_evaluation(
                 else:
                     eval_data = data
                     comm_kb = None
+                    codec_camera_kb = None
 
-                map_res, bits_loss, _ = model(eval_data)
+                _sync_cuda()
+                start_time = time.perf_counter()
+                map_res, bits_loss, map_results = model(eval_data)
+                _sync_cuda()
+                inference_delay_s = time.perf_counter() - start_time
                 if comm_kb is None:
                     comm_kb = float(bits_loss.item())
+                if codec_camera_kb is None:
+                    model_camera_kb = getattr(model, 'last_camera_comm_kb', None)
+                    if model_camera_kb is not None:
+                        codec_camera_kb = model_camera_kb.numpy()
+                    else:
+                        batch_size_fallback = map_res.shape[0]
+                        codec_camera_kb = np.full(
+                            (batch_size_fallback, data_loader.dataset.num_cam if hasattr(data_loader.dataset, 'num_cam') else model.num_cam),
+                            comm_kb / max(model.num_cam, 1),
+                            dtype=np.float32,
+                        )
                 communication_costs.append(comm_kb)
 
                 loss = criterion(map_res, map_gt.to(map_res.device), data_loader.dataset.map_kernel)
@@ -331,11 +374,21 @@ def run_single_evaluation(
                         target_count = 0
 
                     if collect_frame_stats:
+                        camera_target_counts = []
+                        if map_results is not None:
+                            cam_maps = map_results[b].detach().cpu()
+                            for cam_num in range(cam_maps.shape[0]):
+                                camera_target_counts.append(_count_targets_from_map(cam_maps[cam_num], cls_thres))
+                        else:
+                            camera_target_counts = [target_count for _ in range(model.num_cam)]
                         frame_stats.append(
                             {
                                 'frame_id': frame_value,
                                 'num_targets': target_count,
                                 'comm_kb': per_sample_comm,
+                                'camera_target_counts': camera_target_counts,
+                                'camera_comm_kb': codec_camera_kb[b].astype(float).tolist(),
+                                'inference_delay_s': inference_delay_s / max(batch_size, 1),
                             }
                         )
     finally:
@@ -367,9 +420,22 @@ def run_single_evaluation(
     if collect_frame_stats:
         frame_stats_path = os.path.join(output_dir, 'frame_stats.csv')
         with open(frame_stats_path, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=['frame_id', 'num_targets', 'comm_kb'])
+            writer = csv.DictWriter(
+                f,
+                fieldnames=['frame_id', 'num_targets', 'comm_kb', 'camera_target_counts', 'camera_comm_kb', 'inference_delay_s'],
+            )
             writer.writeheader()
-            writer.writerows(frame_stats)
+            for row in frame_stats:
+                writer.writerow(
+                    {
+                        'frame_id': row['frame_id'],
+                        'num_targets': row['num_targets'],
+                        'comm_kb': row['comm_kb'],
+                        'camera_target_counts': ';'.join(map(str, row['camera_target_counts'])),
+                        'camera_comm_kb': ';'.join(f'{x:.8f}' for x in row['camera_comm_kb']),
+                        'inference_delay_s': row['inference_delay_s'],
+                    }
+                )
 
     return {
         'method': method_name,

@@ -207,7 +207,7 @@ def apply_codec_packet_loss_to_batch(
     concealment: str = 'previous',
     transmitted_index: int = -1,
     rng: Optional[np.random.Generator] = None,
-) -> Tuple[torch.Tensor, float]:
+) -> Tuple[torch.Tensor, float, np.ndarray]:
     if rng is None:
         rng = np.random.default_rng(1)
 
@@ -215,6 +215,7 @@ def apply_codec_packet_loss_to_batch(
     batch_size, time_steps, num_cam = processed.shape[:3]
     current_idx = transmitted_index if transmitted_index >= 0 else time_steps - 1
     total_kb = 0.0
+    per_camera_kb = np.zeros((batch_size, num_cam), dtype=np.float32)
 
     if isinstance(frame_ids, torch.Tensor):
         frame_key_list = frame_ids.detach().cpu().tolist()
@@ -229,6 +230,7 @@ def apply_codec_packet_loss_to_batch(
             cache_key = f'{codec_runner.codec}_{frame_key}_cam{cam}'
             decoded, encoded_bytes = codec_runner.encode_decode(processed[b, current_idx, cam], cache_key=cache_key)
             total_kb += encoded_bytes / 1024.0
+            per_camera_kb[b, cam] = encoded_bytes / 1024.0
 
             if rng.random() < packet_loss_rate:
                 if concealment == 'previous' and current_idx > 0:
@@ -239,4 +241,4 @@ def apply_codec_packet_loss_to_batch(
                 replacement = decoded
             processed[b, current_idx, cam] = replacement.to(processed.device, dtype=processed.dtype)
 
-    return processed, total_kb / max(batch_size, 1)
+    return processed, total_kb / max(batch_size, 1), per_camera_kb

@@ -345,6 +345,7 @@ class PerspTransDetector(nn.Module):
         self.frame_dropout_noise_std = getattr(args, 'frame_dropout_noise_std', 0.05)
         self.lambda_consistency = getattr(args, 'lambda_consistency', 0.03)
         self.rate_view_dropout_prob = getattr(args, 'rate_view_dropout_prob', 0.2)
+        self.last_camera_comm_kb = None
 
         self.intrinsic_matrices = dataset.base.intrinsic_matrices
         self.extrinsic_matrices = dataset.base.extrinsic_matrices
@@ -841,6 +842,14 @@ class PerspTransDetector(nn.Module):
         keep_ratio = tx_mask.mean()
         rate_ratio = view_rate_tensor.mean()
         tx_kb_proxy = self.target_comm_kb * keep_ratio * rate_ratio
+        self.last_camera_comm_kb = (
+            torch.full(
+                (b, self.num_cam),
+                float(entropy_kb.detach().item()) / max(self.num_cam, 1),
+                device=map_result.device,
+                dtype=map_result.dtype,
+            )
+        ).cpu()
 
         if self.training and self.rate_aware_training and self.rate_view_dropout_prob > 0:
             random_drop = (torch.rand(b, self.num_cam, device=bev_views.device) > self.rate_view_dropout_prob).float()
@@ -911,8 +920,10 @@ class PerspTransDetector(nn.Module):
         if self.method == 'baseline_refined' and self.refine_weighted_entropy:
             likelihood_mask = camera_keep_mask.view(b, n, 1, 1, 1) * channel_keep_mask.view(b, n, self.channel, 1, 1)
             bits_loss = (torch.log(feature_likelihoods) * likelihood_mask).sum() / (-math.log(2))
+            camera_bits = (torch.log(feature_likelihoods) * likelihood_mask).sum(dim=(2, 3, 4)) / (-math.log(2))
         else:
             bits_loss = (torch.log(feature_likelihoods).sum() / (-math.log(2)))
+            camera_bits = torch.log(feature_likelihoods).sum(dim=(2, 3, 4)) / (-math.log(2))
 
         feature4prediction = imgs_list_feature[:, -(self.tau_1 + 1):]
         feature4prediction = torch.swapaxes(feature4prediction, 1, 2)
@@ -1008,6 +1019,7 @@ class PerspTransDetector(nn.Module):
         map_result = self.temporal_fusion_module(world_features, mask)
         if strong_map_result is not None and self.refine_strong_head_weight > 0:
             map_result = (1.0 - self.refine_strong_head_weight) * map_result + self.refine_strong_head_weight * strong_map_result
+        self.last_camera_comm_kb = (camera_bits / 8 / 1024).detach().cpu()
         bits_loss = bits_loss / 8 / 1024
 
         if not self.training:
