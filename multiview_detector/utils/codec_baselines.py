@@ -3,6 +3,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from typing import Dict, Optional, Tuple
 
 import numpy as np
@@ -207,7 +208,7 @@ def apply_codec_packet_loss_to_batch(
     concealment: str = 'previous',
     transmitted_index: int = -1,
     rng: Optional[np.random.Generator] = None,
-) -> Tuple[torch.Tensor, float, np.ndarray]:
+) -> Tuple[torch.Tensor, float, np.ndarray, np.ndarray]:
     if rng is None:
         rng = np.random.default_rng(1)
 
@@ -216,6 +217,7 @@ def apply_codec_packet_loss_to_batch(
     current_idx = transmitted_index if transmitted_index >= 0 else time_steps - 1
     total_kb = 0.0
     per_camera_kb = np.zeros((batch_size, num_cam), dtype=np.float32)
+    per_camera_codec_delay_s = np.zeros((batch_size, num_cam), dtype=np.float32)
 
     if isinstance(frame_ids, torch.Tensor):
         frame_key_list = frame_ids.detach().cpu().tolist()
@@ -228,7 +230,9 @@ def apply_codec_packet_loss_to_batch(
         frame_key = frame_key_list[b]
         for cam in range(num_cam):
             cache_key = f'{codec_runner.codec}_{frame_key}_cam{cam}'
+            start_time = time.perf_counter()
             decoded, encoded_bytes = codec_runner.encode_decode(processed[b, current_idx, cam], cache_key=cache_key)
+            per_camera_codec_delay_s[b, cam] = time.perf_counter() - start_time
             total_kb += encoded_bytes / 1024.0
             per_camera_kb[b, cam] = encoded_bytes / 1024.0
 
@@ -241,4 +245,4 @@ def apply_codec_packet_loss_to_batch(
                 replacement = decoded
             processed[b, current_idx, cam] = replacement.to(processed.device, dtype=processed.dtype)
 
-    return processed, total_kb / max(batch_size, 1), per_camera_kb
+    return processed, total_kb / max(batch_size, 1), per_camera_kb, per_camera_codec_delay_s

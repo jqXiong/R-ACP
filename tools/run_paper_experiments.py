@@ -1,6 +1,7 @@
 import argparse
 import csv
 import datetime
+import json
 import os
 import sys
 import time
@@ -242,6 +243,49 @@ def _count_targets_from_map(single_map: torch.Tensor, cls_thres: float) -> int:
     return int(count)
 
 
+def _is_visible_in_cam(view: Dict) -> bool:
+    return not (
+        view['xmin'] == -1
+        and view['xmax'] == -1
+        and view['ymin'] == -1
+        and view['ymax'] == -1
+    )
+
+
+def _get_gt_camera_target_counts(dataset, frame_value: int, cache: Dict) -> Optional[List[int]]:
+    if frame_value in cache:
+        return cache[frame_value]
+
+    if '__path_map__' not in cache:
+        annotations_dir = os.path.join(dataset.root, 'annotations_positions')
+        path_map = {}
+        if os.path.isdir(annotations_dir):
+            for fname in os.listdir(annotations_dir):
+                if not fname.endswith('.json'):
+                    continue
+                try:
+                    path_map[int(os.path.splitext(fname)[0])] = os.path.join(annotations_dir, fname)
+                except ValueError:
+                    continue
+        cache['__path_map__'] = path_map
+
+    frame_path = cache['__path_map__'].get(frame_value)
+    if frame_path is None or not os.path.exists(frame_path):
+        return None
+
+    with open(frame_path, 'r', encoding='utf-8') as json_file:
+        all_pedestrians = json.load(json_file)
+
+    counts = [0 for _ in range(dataset.num_cam)]
+    for single_pedestrian in all_pedestrians:
+        for cam in range(dataset.num_cam):
+            if _is_visible_in_cam(single_pedestrian['views'][cam]):
+                counts[cam] += 1
+
+    cache[frame_value] = counts
+    return counts
+
+
 def compute_aopt(frame_stats: List[Dict], capacity_kbps: float, lambda_camera: float, min_targets: int) -> float:
     delta_t = 1.0 / max(lambda_camera, 1e-6)
     total = 0.0
@@ -249,13 +293,14 @@ def compute_aopt(frame_stats: List[Dict], capacity_kbps: float, lambda_camera: f
     for row in frame_stats:
         target_counts = row['camera_target_counts']
         camera_comm_kb = row['camera_comm_kb']
+        camera_codec_delay_s = row.get('camera_codec_delay_s', [0.0 for _ in target_counts])
         inference_delay_s = row['inference_delay_s']
         worst_case = 0.0
-        for g_k, comm_kb_k in zip(target_counts, camera_comm_kb):
+        for g_k, comm_kb_k, codec_delay_s in zip(target_counts, camera_comm_kb, camera_codec_delay_s):
             if g_k < min_targets:
                 continue
             d_transmission = comm_kb_k / max(capacity_kbps, 1e-6)
-            d_total_k = inference_delay_s + d_transmission
+            d_total_k = inference_delay_s + codec_delay_s + d_transmission
             aopt_k = g_k * (delta_t / 2.0 + d_total_k)
             if aopt_k > worst_case:
                 worst_case = aopt_k
@@ -298,6 +343,7 @@ def run_single_evaluation(
     all_res_list = []
     frame_stats = []
     rng = np.random.default_rng(seed)
+    gt_camera_count_cache = {} if collect_frame_stats else None
 
     try:
         with torch.no_grad():
@@ -306,7 +352,7 @@ def run_single_evaluation(
                     break
 
                 if codec_runner is not None:
-                    eval_data, comm_kb, codec_camera_kb = apply_codec_packet_loss_to_batch(
+                    eval_data, comm_kb, codec_camera_kb, codec_camera_delay_s = apply_codec_packet_loss_to_batch(
                         data,
                         frame,
                         codec_runner=codec_runner,
@@ -319,6 +365,7 @@ def run_single_evaluation(
                     eval_data = data
                     comm_kb = None
                     codec_camera_kb = None
+                    codec_camera_delay_s = None
 
                 _sync_cuda()
                 start_time = time.perf_counter()
@@ -338,6 +385,8 @@ def run_single_evaluation(
                             comm_kb / max(model.num_cam, 1),
                             dtype=np.float32,
                         )
+                if codec_camera_delay_s is None:
+                    codec_camera_delay_s = np.zeros_like(codec_camera_kb, dtype=np.float32)
                 communication_costs.append(comm_kb)
 
                 loss = criterion(map_res, map_gt.to(map_res.device), data_loader.dataset.map_kernel)
@@ -374,12 +423,18 @@ def run_single_evaluation(
                         target_count = 0
 
                     if collect_frame_stats:
-                        camera_target_counts = []
-                        if map_results is not None:
+                        camera_target_counts = _get_gt_camera_target_counts(
+                            data_loader.dataset,
+                            frame_value,
+                            gt_camera_count_cache,
+                        )
+                        if camera_target_counts is None:
+                            camera_target_counts = []
+                        if not camera_target_counts and map_results is not None:
                             cam_maps = map_results[b].detach().cpu()
                             for cam_num in range(cam_maps.shape[0]):
                                 camera_target_counts.append(_count_targets_from_map(cam_maps[cam_num], cls_thres))
-                        else:
+                        if not camera_target_counts:
                             camera_target_counts = [target_count for _ in range(model.num_cam)]
                         frame_stats.append(
                             {
@@ -388,6 +443,7 @@ def run_single_evaluation(
                                 'comm_kb': per_sample_comm,
                                 'camera_target_counts': camera_target_counts,
                                 'camera_comm_kb': codec_camera_kb[b].astype(float).tolist(),
+                                'camera_codec_delay_s': codec_camera_delay_s[b].astype(float).tolist(),
                                 'inference_delay_s': inference_delay_s / max(batch_size, 1),
                             }
                         )
@@ -422,7 +478,15 @@ def run_single_evaluation(
         with open(frame_stats_path, 'w', newline='') as f:
             writer = csv.DictWriter(
                 f,
-                fieldnames=['frame_id', 'num_targets', 'comm_kb', 'camera_target_counts', 'camera_comm_kb', 'inference_delay_s'],
+                fieldnames=[
+                    'frame_id',
+                    'num_targets',
+                    'comm_kb',
+                    'camera_target_counts',
+                    'camera_comm_kb',
+                    'camera_codec_delay_s',
+                    'inference_delay_s',
+                ],
             )
             writer.writeheader()
             for row in frame_stats:
@@ -433,6 +497,7 @@ def run_single_evaluation(
                         'comm_kb': row['comm_kb'],
                         'camera_target_counts': ';'.join(map(str, row['camera_target_counts'])),
                         'camera_comm_kb': ';'.join(f'{x:.8f}' for x in row['camera_comm_kb']),
+                        'camera_codec_delay_s': ';'.join(f'{x:.8f}' for x in row['camera_codec_delay_s']),
                         'inference_delay_s': row['inference_delay_s'],
                     }
                 )
